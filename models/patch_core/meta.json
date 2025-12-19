@@ -1,0 +1,6 @@
+{
+  "sampling_ratio": 0.01,
+  "n_neighbors": 9,
+  "use_fp16": true,
+  "faiss": false
+}

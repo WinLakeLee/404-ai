@@ -1,0 +1,24 @@
+# Web Framework
+flask==3.0.0
+werkzeug==3.0.1
+
+# Deep Learning
+ultralytics==8.1.0
+
+# PyTorch with CUDA 12.6 support
+# Note: Install with: pip3 install torch torchvision --index-url https://download.pytorch.org/whl/cu126
+torch>=2.1.0
+torchvision>=0.16.0
+
+# MQTT
+paho-mqtt==1.6.1
+
+# Image Processing
+pillow==10.1.0
+
+# Environment Variables
+python-dotenv==1.0.0
+
+# Additional dependencies
+numpy>=1.24.0
+opencv-python>=4.8.0
