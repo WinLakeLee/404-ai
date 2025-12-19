@@ -212,3 +212,6 @@ uploads/
 *.pth
 *.pt
 *.json
+/debug
+/scripts
+*.jpg

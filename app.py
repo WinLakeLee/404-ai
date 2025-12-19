@@ -24,6 +24,9 @@ import tempfile
 import numpy as np
 from PIL import Image
 import io
+import re
+import base64
+import json
 
 # Load environment variables from .env (or DOTENV_PATH) before reading any settings
 load_dotenv(dotenv_path=os.environ.get("DOTENV_PATH", ".env"), override=True)
@@ -32,19 +35,14 @@ app = Flask(__name__)
 _EXECUTOR = ThreadPoolExecutor(max_workers=int(os.environ.get("APP_WORKERS", 4)))
 
 # MQTT settings (single broker for pub/sub)
-_MQTT_BROKER = os.environ.get("MQTT_BROKER") or "192.168.0.25"
+_MQTT_BROKER = os.environ.get("MQTT_BROKER") or "localhost"
 
 _MQTT_PORT = int(os.environ.get("MQTT_PORT") or 1883)
 _MQTT_TLS = (os.environ.get("MQTT_TLS") or "0").lower() in ("1", "true", "yes")
 _MQTT_KEEPALIVE = int(os.environ.get("MQTT_KEEPALIVE", 60))
 _IN_TOPIC = os.environ.get("IN_MQTT_TOPIC") or "camera01/control"
-_OUT_TOPIC = app.config.get("MQTT_TOPIC", "camera01/result")
+_OUT_TOPIC = os.environ.get("MQTT_TOPIC") or "camera01/result"
 _OUT_QOS = int(os.environ.get("OUT_MQTT_QOS") or os.environ.get("MQTT_QOS") or 1)
-
-# Detection mode: 'internal' (default), 'external', or 'both'
-# - internal: use local `_SCRATCH_PIPELINE` only
-# - external: call remote detector service only
-# - both: run both and combine results
 
 app.config["MQTT_BROKER_URL"] = _MQTT_BROKER
 app.config["MQTT_BROKER_PORT"] = _MQTT_PORT
@@ -61,8 +59,56 @@ try:
     def _on_message(client, userdata, message):
         # delegate processing to executor
         def _task():
+            # Normalize/decode MQTT payload (handle hex, JSON with base64, raw base64)
+            def _normalize_payload(data: bytes) -> bytes:
+                # If not decodable as text, return raw bytes
+                try:
+                    s = data.decode("utf-8").strip()
+                except Exception:
+                    return data
+
+                # JSON object containing a base64 image
+                if s.startswith("{") or s.startswith("["):
+                    try:
+                        obj = json.loads(s)
+                        if isinstance(obj, dict):
+                            for key in ("image", "payload", "data"):
+                                if key in obj and isinstance(obj[key], str):
+                                    b64 = obj[key].strip()
+                                    # data URI
+                                    if b64.startswith("data:") and "base64," in b64:
+                                        try:
+                                            return base64.b64decode(
+                                                b64.split("base64,", 1)[1]
+                                            )
+                                        except Exception:
+                                            pass
+                                    try:
+                                        return base64.b64decode(b64, validate=True)
+                                    except Exception:
+                                        pass
+                    except Exception:
+                        pass
+
+                # Hex string (e.g., '7b226361' -> b'{"ca')
+                if re.fullmatch(r"[0-9a-fA-F]+", s) and len(s) % 2 == 0:
+                    try:
+                        return bytes.fromhex(s)
+                    except Exception:
+                        pass
+
+                # Raw base64 string
+                try:
+                    return base64.b64decode(s, validate=True)
+                except Exception:
+                    pass
+
+                return data
+
+            payload = _normalize_payload(message.payload)
+
             # 이미지 형식 검증
-            img_info = validate_image_format(message.payload)
+            img_info = validate_image_format(payload)
 
             if not img_info["valid"]:
                 error_resp = {
@@ -87,7 +133,8 @@ try:
                 f"✅ MQTT 이미지 수신: {filename} ({img_info['width']}x{img_info['height']}, {img_info['size']} bytes)"
             )
 
-            resp = process_image_bytes(message.payload, filename, img_info["mime_type"])
+            # use normalized payload (may have been decoded from hex/base64/JSON)
+            resp = process_image(payload, filename, img_info["mime_type"])
             try:
                 publish_with_client(_MQTT_CLIENT, resp, topic=_OUT_TOPIC, qos=_OUT_QOS)
             except Exception:
@@ -208,10 +255,7 @@ try:
         ),
         patchcore_checkpoint=os.environ.get(
             "PATCHCORE_CHECKPOINT",
-            os.path.join(
-                "models",
-                "patch_core",
-            ),
+            os.path.join("models", "patch_core"),
         ),
         device=os.environ.get("DEVICE", "cuda"),
         conf_threshold=float(os.environ.get("YOLO_CONF_THRESHOLD", 0.25)),
@@ -224,7 +268,7 @@ except Exception as e:
 
 # Load configuration object
 env = os.environ.get("FLASK_ENV", "development")
-# Support both a `config` dict (mapping env->obj) or the config module itself
+
 
 @app.route("/")
 def index():
@@ -264,24 +308,23 @@ def health():
     )
 
 
-def process_image_bytes(
+def process_image(
     data: bytes, filename: str = "image.jpg", mimetype: str | None = None
 ):
     """이미지 바이트를 처리하고 모든 서비스 호출"""
-
     # 이미지 형식 검증
     img_info = validate_image_format(data)
 
     if not img_info["valid"]:
         return {
+            "result": "invalid_image_format",
+            "detector": {"error": "detector_not_configured"},
+            "inference": {"reconstruct": {"error": "inference_not_configured"}, "patchcore": {"error": "inference_not_configured"}},
             "scratch_detection": {
                 "error": "invalid_image_format",
                 "detail": img_info.get("error", "알 수 없는 오류"),
                 "payload_size": img_info.get("size", 0),
             },
-            "vision": {"error": "invalid_image_format"},
-            "reconstruct": {"error": "invalid_image_format"},
-            "patchcore": {"error": "invalid_image_format"},
             "timestamp": datetime.now().isoformat(),
         }
 
@@ -290,84 +333,132 @@ def process_image_bytes(
         f"📸 이미지 수신: {filename} ({img_info['width']}x{img_info['height']}, format={img_info['format']}, size={img_info['size']} bytes)"
     )
 
-    files = {
-        "image": (filename or "image.jpg", data, mimetype or img_info["mime_type"])
-    }
-    # Detector service (HTTP) - only called in 'external' or 'both' modes
+    # placeholders for removed external services
     detector_result = {"error": "detector_not_configured"}
+    infer_recon = {"error": "inference_recon_not_configured"}
+    infer_patch = {"error": "inference_patch_not_configured"}
 
+    # Run internal scratch pipeline if available
+    scratch_result = {"skipped": True, "reason": "scratch_pipeline_not_configured"}
     try:
-        with tempfile.NamedTemporaryFile(
-            suffix=img_info["extension"], delete=False
-        ) as tmp:
-            tmp.write(data)
-            tmp_path = tmp.name
+        if _SCRATCH_PIPELINE is not None:
+            with tempfile.NamedTemporaryFile(suffix=img_info["extension"], delete=False) as tmp:
+                tmp.write(data)
+                tmp_path = tmp.name
 
-        result, result_image = _SCRATCH_PIPELINE.process_image(tmp_path)
-
-        import base64
-
-        # Try to use OpenCV for encoding; if not available, fall back to PIL
-        try:
-            import cv2 as _cv2
-
-            success, buffer = _cv2.imencode(".jpg", result_image)
-            if success:
-                bytes_img = buffer.tobytes()
-            else:
-                bytes_img = b""
-        except Exception:
+            # try path first, then array
             try:
-                bio = io.BytesIO()
-                Image.fromarray(result_image).save(bio, format="JPEG")
-                bytes_img = bio.getvalue()
+                result, result_image = _SCRATCH_PIPELINE.process_image(tmp_path)
+            except Exception as e_path:
+                try:
+                    pil_img = Image.open(tmp_path).convert("RGB")
+                    arr = np.array(pil_img)
+                    result, result_image = _SCRATCH_PIPELINE.process_image(arr)
+                except Exception:
+                    try:
+                        os.unlink(tmp_path)
+                    except Exception:
+                        pass
+                    raise e_path
+
+            # encode result_image to jpeg base64
+            bytes_img = b""
+            try:
+                import cv2 as _cv2
+
+                success, buffer = _cv2.imencode(".jpg", result_image)
+                if success:
+                    bytes_img = buffer.tobytes()
             except Exception:
-                bytes_img = b""
+                try:
+                    bio = io.BytesIO()
+                    Image.fromarray(result_image).save(bio, format="JPEG")
+                    bytes_img = bio.getvalue()
+                except Exception:
+                    bytes_img = b""
 
-        img_base64 = base64.b64encode(bytes_img).decode("utf-8") if bytes_img else ""
+            img_base64 = base64.b64encode(bytes_img).decode("utf-8") if bytes_img else ""
 
-        scratch_result = {
-            "result": [
-                (
-                    "ok"
-                    if not result.get("scratch_detected")
-                    and not result.get("broken_detected")
-                    and not result.get("separated_detected")
-                    and not result.get("anomaly_detected")
-                    else "detected"
-                )
-            ],
-            "scratch_detected": result.get("scratch_detected"),
-            "broken_detected": result.get("broken_detected"),
-            "separated_detected": result.get("separated_detected"),
-            "anomaly_detected": result.get("anomaly_detected"),
-            "car_regions": [
-                {
-                    "bbox": r["bbox"],
-                    "yolo_conf": r["yolo_conf"],
-                    "class_id": r["class_id"],
-                    "class_name": r["class_name"],
-                    "anomaly": {
-                        "is_anomaly": r["anomaly"]["is_anomaly"],
-                        "score": round(r["anomaly"]["score"], 4),
-                        "threshold": round(r["anomaly"]["threshold"], 4),
-                    },
-                    "defect_flags": {
-                        "broken_by_yolo": r["broken_by_yolo"],
-                        "separated_by_yolo": r["separated_by_yolo"],
-                        "anomaly_by_patchcore": r["anomaly_by_patchcore"],
-                    },
-                }
-                for r in result.get("car_regions", [])
-            ],
-            "result_image": f"data:image/jpeg;base64,{img_base64}",
-        }
+            scratch_result = {
+                "success": True,
+                "scratch_detected": result.get("scratch_detected"),
+                "broken_detected": result.get("broken_detected"),
+                "separated_detected": result.get("separated_detected"),
+                "anomaly_detected": result.get("anomaly_detected"),
+                "car_regions": [
+                    {
+                        "bbox": r.get("bbox"),
+                        "yolo_conf": r.get("yolo_conf"),
+                        "class_id": r.get("class_id"),
+                        "class_name": r.get("class_name"),
+                        "anomaly": r.get("anomaly"),
+                        "defect_flags": {
+                            "broken_by_yolo": r.get("broken_by_yolo"),
+                            "separated_by_yolo": r.get("separated_by_yolo"),
+                            "anomaly_by_patchcore": r.get("anomaly_by_patchcore"),
+                        },
+                    }
+                    for r in result.get("car_regions", [])
+                ],
+                "result_image": f"data:image/jpeg;base64,{img_base64}",
+                "pipeline_result": result if isinstance(result, dict) else {},
+            }
 
-        os.unlink(tmp_path)
+            # Debug: save pipeline result image and a short pipeline_result summary
+            try:
+                debug_dir = os.path.join(os.getcwd(), "debug")
+                os.makedirs(debug_dir, exist_ok=True)
+                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                debug_img_path = os.path.join(debug_dir, f"scratch_result_{ts}.jpg")
+
+                # Prefer writing encoded bytes if available, otherwise save result_image directly
+                wrote = False
+                if bytes_img:
+                    try:
+                        with open(debug_img_path, "wb") as df:
+                            df.write(bytes_img)
+                        wrote = True
+                        print(f"[DEBUG] saved scratch result image to {debug_img_path}")
+                    except Exception:
+                        wrote = False
+
+                if not wrote:
+                    try:
+                        import cv2 as _cv2_save
+
+                        _cv2_save.imwrite(debug_img_path, result_image)
+                        wrote = True
+                        print(f"[DEBUG] saved scratch result image via cv2 to {debug_img_path}")
+                    except Exception:
+                        try:
+                            bio2 = io.BytesIO()
+                            Image.fromarray(result_image).convert("RGB").save(bio2, format="JPEG")
+                            with open(debug_img_path, "wb") as df2:
+                                df2.write(bio2.getvalue())
+                            wrote = True
+                            print(f"[DEBUG] saved scratch result image via PIL to {debug_img_path}")
+                        except Exception as e_save:
+                            print(f"[DEBUG] failed to write scratch result image: {e_save}")
+
+                # print compact pipeline result summary
+                try:
+                    summary = {
+                        "scratch_detected": bool(result.get("scratch_detected")),
+                        "car_regions_count": len(result.get("car_regions", [])),
+                    }
+                except Exception:
+                    summary = {"scratch_detected": result.get("scratch_detected")}
+                print(f"[DEBUG] pipeline summary: {json.dumps(summary)}")
+            except Exception as e:
+                print(f"[DEBUG] failed to write debug artifacts: {e}")
+
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
     except Exception as e:
         scratch_result = {"error": "scratch_detection_exception", "detail": str(e)}
 
-    # Combine results according to detection mode. Priority: if any configured source reports detection, mark detected.
     overall_result = "ok"
     try:
         if isinstance(scratch_result, dict) and scratch_result.get("scratch_detected"):
@@ -378,6 +469,7 @@ def process_image_bytes(
     return {
         "result": overall_result,
         "detector": detector_result,
+        "inference": {"reconstruct": infer_recon, "patchcore": infer_patch},
         "scratch_detection": scratch_result,
         "timestamp": datetime.now().isoformat(),
     }
@@ -393,7 +485,7 @@ def detect():
         return jsonify({"error": "empty filename"}), 400
 
     data = file.read()
-    resp = process_image_bytes(data, filename=file.filename, mimetype=file.mimetype)
+    resp = process_image(data, filename=file.filename, mimetype=file.mimetype)
     if _MQTT_CLIENT is not None:
         try:
             publish_with_client(_MQTT_CLIENT, resp, topic=_OUT_TOPIC, qos=_OUT_QOS)
