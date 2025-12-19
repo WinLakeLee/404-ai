@@ -211,3 +211,4 @@ uploads/
 *.pkl
 *.pth
 *.pt
+*.json
