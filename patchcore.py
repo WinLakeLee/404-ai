@@ -18,11 +18,38 @@ import argparse
 import numpy as np
 from PIL import Image
 from pathlib import Path
-from ultralytics import YOLO
+
+# PyTorch 2.6+ sets torch.load(weights_only=True) by default. Allow YOLO checkpoints safely.
+os.environ.setdefault("TORCH_LOAD_WEIGHTS_ONLY", "0")
+try:
+    from torch.serialization import add_safe_globals
+    import ultralytics.nn.tasks as _ultra_tasks
+
+    _safe_list = []
+    for _name in ["DetectionModel", "SegmentationModel", "ClassificationModel", "PoseModel", "OBBModel"]:
+        if hasattr(_ultra_tasks, _name):
+            _safe_list.append(getattr(_ultra_tasks, _name))
+    if _safe_list:
+        add_safe_globals(_safe_list)
+
+    # Torch 2.6+ defaults weights_only=True; force False for trusted local checkpoints.
+    _ORIG_TORCH_LOAD = torch.load
+
+    def _safe_torch_load(*args, **kwargs):
+        if "weights_only" not in kwargs or kwargs.get("weights_only", False):
+            kwargs["weights_only"] = False
+        return _ORIG_TORCH_LOAD(*args, **kwargs)
+
+    torch.load = _safe_torch_load
+except Exception:
+    # ultralytics import may fail here if not installed; YOLO import below will surface errors.
+    pass
+
 import torch.nn.functional as F
 import torchvision.models as models
 from torchvision import transforms
 from sklearn.neighbors import NearestNeighbors
+from ultralytics import YOLO
 
 # 모듈 경로 추가
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -189,6 +216,77 @@ class PatchCoreOptimized:
         # 따라서 반환 시에는 float32로 캐스팅하여 CPU로 보냅니다.
         return output_features.float().cpu()
 
+    # -----------------------------------------------------
+    # 추가: 예측용 feature 추출 + anomaly score 계산
+    # -----------------------------------------------------
+    def extract_features_for_predict(self, x):
+        """Return (features_cpu, patches_per_image).
+
+        features_cpu: torch.Tensor (total_patches, dim)
+        patches_per_image: int
+        """
+        self.features = []
+
+        x = x.to(self.device)
+        if self.use_fp16:
+            x = x.half()
+
+        with torch.no_grad():
+            self.backbone(x)
+
+        f2 = self.features[0]
+        f3 = self.features[1]
+
+        f3_resized = F.interpolate(f3, size=f2.shape[-2:], mode="bilinear", align_corners=True)
+        concat_features = torch.cat([f2, f3_resized], dim=1)
+        patch_features = F.avg_pool2d(concat_features, kernel_size=3, stride=1, padding=1)
+
+        patch_features = patch_features.permute(0, 2, 3, 1)
+        b, h, w, c = patch_features.shape
+        patches_per_image = int(h * w)
+        feats = patch_features.reshape(-1, c)
+        return feats.float().cpu(), patches_per_image
+
+    def predict(self, x, score_type="max"):
+        """Compute per-image anomaly scores for input batch x.
+
+        score_type: 'max' (default) or 'mean' over patch scores.
+        Returns: torch.Tensor shape (batch_size,)
+        """
+        if self.memory_bank is None:
+            raise RuntimeError("memory_bank is not initialized")
+
+        feats_cpu, patches_per_image = self.extract_features_for_predict(x)
+        feats_np = feats_cpu.numpy().astype("float32")
+        total_patches, dim = feats_np.shape
+        if patches_per_image <= 0:
+            raise RuntimeError("Invalid patches_per_image computed")
+        if total_patches % patches_per_image != 0:
+            raise RuntimeError("Mismatch in patches_per_image and total_patches")
+
+        batch_size = total_patches // patches_per_image
+
+        k = min(self.n_neighbors, self.memory_bank.shape[0])
+
+        if self.faiss_index is not None:
+            D, _ = self.faiss_index.search(feats_np, k)
+            dists = D.astype("float32")
+        elif self.knn is not None:
+            dists, _ = self.knn.kneighbors(feats_np, n_neighbors=k)
+            dists = dists.astype("float32")
+        else:
+            raise RuntimeError("No index available for nearest neighbor search")
+
+        patch_scores = dists.mean(axis=1)  # (total_patches,)
+        patch_scores = patch_scores.reshape(batch_size, patches_per_image)
+
+        if score_type == "mean":
+            img_scores = patch_scores.mean(axis=1)
+        else:
+            img_scores = patch_scores.max(axis=1)
+
+        return torch.from_numpy(img_scores)
+
 
 class AnomalyDetectionPipeline:
     def __init__(
@@ -216,6 +314,14 @@ class AnomalyDetectionPipeline:
         self.device = torch.device(device if torch.cuda.is_available() else "cpu")
         self.conf_threshold = conf_threshold
         self.anomaly_threshold = anomaly_threshold
+        # PatchCore 기본값 보관 (meta 누락 시 사용)
+        self.sampling_ratio = 0.01
+        self.use_fp16_default = True
+        # 클래스별 임계값 (없으면 기본 anomaly_threshold 사용)
+        self.class_anomaly_thresholds = {
+            1: float("inf"),  # car: PatchCore로 결함 판단하지 않음
+            4: float("inf"),  # car_housing: PatchCore로 결함 판단하지 않음
+        }
 
         # 차량 관련 클래스 ID (data.yaml 기준)
         # 0: objects, 1: car, 2: car_broken_area, 3: car_floor, 4: car_housing, 5: car_scratch, 6: car_separated
@@ -228,6 +334,14 @@ class AnomalyDetectionPipeline:
             4: "car_housing",
             5: "car_scratch",
             6: "car_separated",
+        }
+
+        # 시각화 색상 팔레트 (BGR)
+        self.viz_colors = {
+            "normal": (40, 200, 40),
+            "broken_yolo": (0, 165, 255),
+            "separated_yolo": (255, 0, 255),
+            "patchcore_anomaly": (0, 0, 255),
         }
 
         print(f"🖥️  Device: {self.device}")
@@ -255,32 +369,117 @@ class AnomalyDetectionPipeline:
     def _load_patchcore(self, checkpoint_dir):
         """PatchCore 모델 로드"""
         checkpoint_dir = Path(checkpoint_dir)
+        import json
 
-        # 메모리 뱅크 로드
+        # pkl 경로는 더 이상 사용하지 않음: 항상 memory_bank.npy + meta.json 사용
         memory_bank_path = checkpoint_dir / "memory_bank.npy"
         if not memory_bank_path.exists():
             raise FileNotFoundError(f"Memory bank not found: {memory_bank_path}")
 
-        # 메타데이터 로드
-        import json
-
         meta_path = checkpoint_dir / "meta.json"
+        if not meta_path.exists():
+            raise FileNotFoundError(f"Meta file not found: {meta_path}")
+
         with open(meta_path, "r") as f:
             meta = json.load(f)
 
         # 모델 생성
         model = PatchCoreOptimized(
             backbone_name="wide_resnet50_2",
-            sampling_ratio=meta["sampling_ratio"],
-            use_fp16=meta["use_fp16"],
+            sampling_ratio=meta.get("sampling_ratio", getattr(self, "sampling_ratio", 0.01)),
+            use_fp16=meta.get("use_fp16", getattr(self, "use_fp16_default", True)),
         ).to(self.device)
 
         # 메모리 뱅크 로드
         model.memory_bank = np.load(str(memory_bank_path))
-        model.n_neighbors = meta["n_neighbors"]
+        model.n_neighbors = int(meta.get("n_neighbors", model.n_neighbors))
         model._build_index()
 
         return model
+
+    def _color_for_detection(self, is_broken_yolo, is_separated_yolo, is_anomaly_pc):
+        if is_broken_yolo:
+            return self.viz_colors["broken_yolo"], 3
+        if is_separated_yolo:
+            return self.viz_colors["separated_yolo"], 3
+        if is_anomaly_pc:
+            return self.viz_colors["patchcore_anomaly"], 3
+        return self.viz_colors["normal"], 2
+
+    def _place_label_box(self, x1, y1, label_size, occupied_boxes, img_h):
+        """Place label to reduce overlap; returns (top, bottom)."""
+        height = label_size[1] + 10
+        top = max(y1 - height, 5)
+        bottom = top + height
+
+        def _overlaps(a, b):
+            ax1, ay1, ax2, ay2 = a
+            bx1, by1, bx2, by2 = b
+            return not (ax2 < bx1 or ax1 > bx2 or ay2 < by1 or ay1 > by2)
+
+        for _ in range(8):
+            box = (x1, top, x1 + label_size[0], bottom)
+            has_overlap = any(_overlaps(box, other) for other in occupied_boxes)
+            if not has_overlap and bottom < img_h - 5:
+                break
+            # move label downward to avoid overlap; clamp near bottom
+            top = min(img_h - height - 5, top + height + 6)
+            bottom = top + height
+
+        occupied_boxes.append((x1, top, x1 + label_size[0], bottom))
+        return top, bottom
+
+    def _draw_legend(self, image):
+        entries = [
+            ("Broken (YOLO)", self.viz_colors["broken_yolo"]),
+            ("Separated (YOLO)", self.viz_colors["separated_yolo"]),
+            ("Anomaly (PatchCore)", self.viz_colors["patchcore_anomaly"]),
+        ]
+
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        scale = 0.6
+        thickness = 2
+        padding = 8
+        swatch = 14
+        line_gap = 6
+
+        text_sizes = [cv2.getTextSize(lbl, font, scale, thickness)[0] for lbl, _ in entries]
+        max_w = max(sz[0] for sz in text_sizes)
+        text_h = max(sz[1] for sz in text_sizes)
+
+        box_w = padding * 3 + swatch + max_w
+        box_h = padding * 2 + len(entries) * text_h + (len(entries) - 1) * line_gap
+
+        h, w = image.shape[:2]
+        x1 = int(w - box_w - 10)
+        y1 = int(h - box_h - 10)
+        x2 = int(w - 10)
+        y2 = int(h - 10)
+
+        cv2.rectangle(image, (x1, y1), (x2, y2), (245, 245, 245), -1)
+        cv2.rectangle(image, (x1, y1), (x2, y2), (80, 80, 80), 1)
+
+        y_cursor = y1 + padding + text_h
+        for (label, color), sz in zip(entries, text_sizes):
+            swatch_top = y_cursor - text_h
+            # Draw color using outline to match box borders
+            cv2.rectangle(
+                image,
+                (x1 + padding, swatch_top),
+                (x1 + padding + swatch, swatch_top + text_h),
+                color,
+                2,
+            )
+            cv2.putText(
+                image,
+                label,
+                (x1 + padding * 2 + swatch, y_cursor),
+                font,
+                scale,
+                (0, 0, 0),
+                thickness,
+            )
+            y_cursor += text_h + line_gap
 
     def detect_car_regions(self, image_path):
         """
@@ -318,7 +517,7 @@ class AnomalyDetectionPipeline:
 
         return car_regions
 
-    def detect_anomaly_in_region(self, image, bbox):
+    def detect_anomaly_in_region(self, image, bbox, threshold=None):
         """크롭된 차량 영역에서 PatchCore로 anomaly 점수 계산"""
         x1, y1, x2, y2 = bbox
 
@@ -334,12 +533,13 @@ class AnomalyDetectionPipeline:
 
         scores = self.patchcore.predict(img_tensor, score_type="max")
         anomaly_score = float(scores[0])
-        is_anomaly = anomaly_score >= self.anomaly_threshold
+        th = threshold if threshold is not None else self.anomaly_threshold
+        is_anomaly = anomaly_score >= th
 
         return {
             "is_anomaly": bool(is_anomaly),
             "score": anomaly_score,
-            "threshold": self.anomaly_threshold,
+            "threshold": th,
         }
 
     def process_image(self, image_path, save_path=None):
@@ -361,6 +561,7 @@ class AnomalyDetectionPipeline:
             raise ValueError(f"이미지를 로드할 수 없습니다: {image_path}")
 
         result_image = image.copy()
+        label_boxes = []  # text disabled; kept for potential future use
 
         # Stage 1: YOLO로 차량 영역 감지
         car_regions = self.detect_car_regions(image_path)
@@ -380,11 +581,25 @@ class AnomalyDetectionPipeline:
             bbox = region["bbox"]
             x1, y1, x2, y2 = bbox
 
-            # PatchCore로 anomaly 감지 (스크래치/파손/분리 공통 임계값)
-            anomaly_result = self.detect_anomaly_in_region(image, bbox)
-
             cls_id = region["class_id"]
             cls_name = self.class_names.get(cls_id, f"class_{cls_id}")
+
+            # PatchCore로 anomaly 감지 (클래스별 임계값)
+            class_threshold = self.class_anomaly_thresholds.get(
+                cls_id, self.anomaly_threshold
+            )
+
+            if class_threshold == float("inf"):
+                anomaly_result = {
+                    "is_anomaly": False,
+                    "score": 0.0,
+                    "threshold": class_threshold,
+                    "skipped": True,
+                }
+            else:
+                anomaly_result = self.detect_anomaly_in_region(
+                    image, bbox, threshold=class_threshold
+                )
 
             # 결함 판정 로직
             is_broken_yolo = cls_id == 2
@@ -405,36 +620,14 @@ class AnomalyDetectionPipeline:
 
             # 시각화
             is_defect = is_broken_yolo or is_separated_yolo or is_anomaly_pc
-            color = (0, 0, 255) if is_defect else (0, 255, 0)  # 빨강: 결함, 초록: 정상
-            thickness = 3 if is_defect else 2
+            color, thickness = self._color_for_detection(
+                is_broken_yolo, is_separated_yolo, is_anomaly_pc
+            )
 
             # Bounding box
             cv2.rectangle(result_image, (x1, y1), (x2, y2), color, thickness)
 
-            # 라벨
-            if is_broken_yolo:
-                label = f"broken(yolo)|{anomaly_result['score']:.1f}"
-            elif is_separated_yolo:
-                label = f"separated(yolo)|{anomaly_result['score']:.1f}"
-            else:
-                label = f"{cls_name}|{anomaly_result['score']:.1f}"
-            label_size, _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
-            cv2.rectangle(
-                result_image,
-                (x1, y1 - label_size[1] - 10),
-                (x1 + label_size[0], y1),
-                color,
-                -1,
-            )
-            cv2.putText(
-                result_image,
-                label,
-                (x1, y1 - 5),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.6,
-                (255, 255, 255),
-                2,
-            )
+            # 라벨 표시는 비활성화 (글씨 미표시)
 
             if is_anomaly_pc:
                 results["anomaly_detected"] = True
@@ -452,7 +645,8 @@ class AnomalyDetectionPipeline:
                     f"   ✅ 영역 {i+1}: 정상 (cls={cls_name}, 점수={anomaly_result['score']:.2f})"
                 )
 
-        # 결과 저장 또는 표시
+        # 결과 저장 또는 표시 (범례는 하단 우측에 표시)
+        self._draw_legend(result_image)
         if save_path:
             cv2.imwrite(str(save_path), result_image)
             print(f"   💾 결과 저장: {save_path}")

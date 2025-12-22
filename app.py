@@ -8,6 +8,7 @@ import json
 import requests
 import sys
 from concurrent.futures import ThreadPoolExecutor
+import uuid
 from flask import Flask, jsonify, request
 from mqtt_utils import (
     create_paho_client,
@@ -274,9 +275,14 @@ def scan_for_malware(data: bytes) -> dict:
         s = ""
 
     # PE/EXE header (Windows), ELF (Linux), Mach-O (macOS)
-    if data.startswith(b"MZ") or data.startswith(b"\x7fELF") or data[:4] in (
-        b"\xfe\xed\fa\xcf",
-        b"\xcf\xfa\xed\xfe",
+    if (
+        data.startswith(b"MZ")
+        or data.startswith(b"\x7fELF")
+        or data[:4]
+        in (
+            b"\xfe\xed\fa\xcf",
+            b"\xcf\xfa\xed\xfe",
+        )
     ):
         return {"malware": True, "reason": "executable_header"}
 
@@ -410,7 +416,9 @@ def process_image(
     scratch_result = {"skipped": True, "reason": "scratch_pipeline_not_configured"}
     try:
         if _SCRATCH_PIPELINE is not None:
-            with tempfile.NamedTemporaryFile(suffix=img_info["extension"], delete=False) as tmp:
+            with tempfile.NamedTemporaryFile(
+                suffix=img_info["extension"], delete=False
+            ) as tmp:
                 tmp.write(data)
                 tmp_path = tmp.name
 
@@ -467,32 +475,51 @@ def process_image(
                 except Exception:
                     bytes_img = b""
 
-            img_base64 = base64.b64encode(bytes_img).decode("utf-8") if bytes_img else ""
+            img_base64 = (
+                base64.b64encode(bytes_img).decode("utf-8") if bytes_img else ""
+            )
 
             scratch_result = {
                 "success": True,
+                "result_image": f"data:image/jpeg;base64,{img_base64}",
                 "scratch_detected": result.get("scratch_detected"),
                 "broken_detected": result.get("broken_detected"),
                 "separated_detected": result.get("separated_detected"),
                 "anomaly_detected": result.get("anomaly_detected"),
-                "car_regions": [
-                    {
-                        "bbox": r.get("bbox"),
-                        "yolo_conf": r.get("yolo_conf"),
-                        "class_id": r.get("class_id"),
-                        "class_name": r.get("class_name"),
-                        "anomaly": r.get("anomaly"),
-                        "defect_flags": {
-                            "broken_by_yolo": r.get("broken_by_yolo"),
-                            "separated_by_yolo": r.get("separated_by_yolo"),
-                            "anomaly_by_patchcore": r.get("anomaly_by_patchcore"),
-                        },
-                    }
-                    for r in result.get("car_regions", [])
-                ],
-                "result_image": f"data:image/jpeg;base64,{img_base64}",
-                "pipeline_result": result if isinstance(result, dict) else {},
+                "scratch_count": 0,
+                "broken_count": 0,
+                "separated_count": 0,
             }
+
+            # Populate counts based on car_regions flags
+            car_regions = (
+                result.get("car_regions", []) if isinstance(result, dict) else []
+            )
+            scratch_count = sum(
+                1
+                for r in car_regions
+                if r.get("anomaly_by_patchcore")
+                or (r.get("class_name") == "car_scratch")
+            )
+            broken_count = sum(1 for r in car_regions if r.get("broken_by_yolo"))
+            separated_count = sum(1 for r in car_regions if r.get("separated_by_yolo"))
+
+            scratch_result["scratch_count"] = scratch_count
+            scratch_result["broken_count"] = broken_count
+            scratch_result["separated_count"] = separated_count
+            scratch_result["scratch_detected"] = bool(scratch_count)
+            scratch_result["broken_detected"] = bool(broken_count)
+            scratch_result["separated_detected"] = bool(separated_count)
+            scratch_result["anomaly_detected"] = bool(
+                result.get("anomaly_detected") or scratch_count > 0
+            )
+            scratch_result["result"] = (
+                "detected"
+                if scratch_result["anomaly_detected"]
+                or scratch_result["broken_detected"]
+                or scratch_result["separated_detected"]
+                else "ok"
+            )
 
             # Debug: save pipeline result image and a short pipeline_result summary
             try:
@@ -522,13 +549,17 @@ def process_image(
                     except Exception:
                         try:
                             bio2 = io.BytesIO()
-                            Image.fromarray(result_image).convert("RGB").save(bio2, format="JPEG")
+                            Image.fromarray(result_image).convert("RGB").save(
+                                bio2, format="JPEG"
+                            )
                             with open(debug_img_path, "wb") as df2:
                                 df2.write(bio2.getvalue())
                             wrote = True
                             print(f"[DEBUG] saved scratch result image via PIL")
                         except Exception as e_save:
-                            print(f"[DEBUG] failed to write scratch result image: {e_save}")
+                            print(
+                                f"[DEBUG] failed to write scratch result image: {e_save}"
+                            )
 
                 # print compact pipeline result summary
                 try:
@@ -551,12 +582,18 @@ def process_image(
 
     overall_result = "ok"
     try:
-        if isinstance(scratch_result, dict) and scratch_result.get("scratch_detected"):
+        if isinstance(scratch_result, dict) and (
+            scratch_result.get("scratch_detected")
+            or scratch_result.get("broken_detected")
+            or scratch_result.get("separated_detected")
+            or scratch_result.get("anomaly_detected")
+        ):
             overall_result = "detected"
     except Exception:
         overall_result = "ok"
 
     return {
+        "id": str(uuid.uuid4()),
         "result": overall_result,
         "detection": scratch_result,
         "timestamp": datetime.now().isoformat(),
