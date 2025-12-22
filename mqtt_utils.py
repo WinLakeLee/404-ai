@@ -18,7 +18,7 @@ def _do_publish(payload: dict) -> bool:
 
     broker = os.environ.get('MQTT_BROKER', 'localhost')
     port = int(os.environ.get('MQTT_PORT', 1883))
-    topic = os.environ.get('MQTT_TOPIC', '404ai/detections')
+    topic = os.environ.get('MQTT_TOPIC', 'camera01/result')
     qos = int(os.environ.get('MQTT_QOS', 1))
     username = os.environ.get('MQTT_USERNAME')
     password = os.environ.get('MQTT_PASSWORD')

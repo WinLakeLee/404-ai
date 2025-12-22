@@ -1,12 +1,12 @@
 """
-404-AI orchestrator (Flask): proxies image uploads to vision and inference services.
-Vision service: detector_app.py (FastAPI or Flask-based YOLO/SAM3/RealSense)
-Inference service: inference_app.py (GAN reconstruction + PatchCore)
+404-AI orchestrator (Flask): proxies image uploads to vision  services.
+Inference service: app.py (YOLO + PatchCore)
 """
 
 import os
 import json
 import requests
+import sys
 from concurrent.futures import ThreadPoolExecutor
 from flask import Flask, jsonify, request
 from mqtt_utils import (
@@ -107,18 +107,18 @@ try:
 
             payload = _normalize_payload(message.payload)
 
-            # 이미지 형식 검증
-            img_info = validate_image_format(payload)
-
-            if not img_info["valid"]:
+            # 악성코드 검사만 수행, 포맷 검증은 스킵
+            malware_check = scan_for_malware(payload)
+            if malware_check.get("malware"):
                 error_resp = {
                     "status": "error",
                     "source": "mqtt",
-                    "error": img_info.get("error", "알 수 없는 오류"),
-                    "payload_size": img_info.get("size", 0),
+                    "error": "malware_detected",
+                    "detail": malware_check.get("reason"),
+                    "payload_size": len(payload),
                     "timestamp": datetime.now().isoformat(),
                 }
-                print(f"❌ MQTT 이미지 검증 실패: {img_info.get('error')}")
+                print(f"❌ MQTT 악성 페이로드 차단: {malware_check.get('reason')}")
                 try:
                     publish_with_client(
                         _MQTT_CLIENT, error_resp, topic=_OUT_TOPIC, qos=_OUT_QOS
@@ -126,6 +126,19 @@ try:
                 except Exception:
                     publish_mqtt(error_resp)
                 return
+
+            # 포맷 검증은 강제하지 않음 — 가능한 경우 메타정보를 얻고, 실패 시 기본값을 사용
+            img_info = validate_image_format(payload)
+            if not img_info.get("valid"):
+                img_info = {
+                    "valid": True,
+                    "format": "jpg",
+                    "extension": ".jpg",
+                    "mime_type": "image/jpeg",
+                    "size": len(payload),
+                    "width": 0,
+                    "height": 0,
+                }
 
             # 유효한 이미지 처리
             filename = f"mqtt_{message.topic.replace('/', '_')}{img_info['extension']}"
@@ -245,6 +258,53 @@ def validate_image_format(data: bytes) -> dict:
         }
 
 
+def scan_for_malware(data: bytes) -> dict:
+    """간단한 악성코드/의심 페이로드 검사.
+
+    완전한 악성코드 검사 도구는 아니며, 일반적으로 악성으로 보이는 파일 헤더나
+    스크립트 키워드(예: powershell, cmd, eval, base64_decode 등)를 확인합니다.
+    """
+    if not data:
+        return {"malware": False}
+
+    s = None
+    try:
+        s = data.decode("utf-8", errors="ignore").lower()
+    except Exception:
+        s = ""
+
+    # PE/EXE header (Windows), ELF (Linux), Mach-O (macOS)
+    if data.startswith(b"MZ") or data.startswith(b"\x7fELF") or data[:4] in (
+        b"\xfe\xed\fa\xcf",
+        b"\xcf\xfa\xed\xfe",
+    ):
+        return {"malware": True, "reason": "executable_header"}
+
+    # common script indicators
+    suspicious_terms = [
+        "powershell",
+        "Invoke-Expression".lower(),
+        "cmd.exe",
+        "eval(",
+        "base64",
+        "base64_decode",
+        "wget ",
+        "curl ",
+        "exec(",
+        "os.system",
+    ]
+    for t in suspicious_terms:
+        if t in s:
+            return {"malware": True, "reason": f"suspicious_string:{t}"}
+
+    # zip file may contain executables; mark suspicious if zip and contains exe strings
+    if data.startswith(b"PK"):
+        if b".exe" in data.lower() or b"powershell" in data.lower():
+            return {"malware": True, "reason": "zip_contains_exe_or_script"}
+
+    return {"malware": False}
+
+
 # Initialize Scratch Detection Pipeline
 print("🚀 Scratch Detection Pipeline 초기화 중...")
 try:
@@ -311,32 +371,40 @@ def health():
 def process_image(
     data: bytes, filename: str = "image.jpg", mimetype: str | None = None
 ):
-    """이미지 바이트를 처리하고 모든 서비스 호출"""
-    # 이미지 형식 검증
-    img_info = validate_image_format(data)
+    """이미지 바이트를 처리하고 모든 서비스 호출
 
-    if not img_info["valid"]:
+    포맷 검증을 엄격히 수행하지 않고, 먼저 악성코드 여부만 검사합니다.
+    """
+    # 악성코드 검사: 악성으로 판단되면 즉시 응답
+    malware_check = scan_for_malware(data)
+    if malware_check.get("malware"):
         return {
-            "result": "invalid_image_format",
-            "detector": {"error": "detector_not_configured"},
-            "inference": {"reconstruct": {"error": "inference_not_configured"}, "patchcore": {"error": "inference_not_configured"}},
-            "scratch_detection": {
-                "error": "invalid_image_format",
-                "detail": img_info.get("error", "알 수 없는 오류"),
-                "payload_size": img_info.get("size", 0),
+            "result": "malware_blocked",
+            "detection": {
+                "error": "malware_detected",
+                "detail": malware_check.get("reason"),
+                "payload_size": len(data),
             },
             "timestamp": datetime.now().isoformat(),
         }
 
-    # 유효한 이미지 정보 로깅
-    print(
-        f"📸 이미지 수신: {filename} ({img_info['width']}x{img_info['height']}, format={img_info['format']}, size={img_info['size']} bytes)"
-    )
+    # 가능한 경우 포맷/크기 정보를 얻되, 실패해도 계속 진행
+    img_info = validate_image_format(data)
+    if not img_info.get("valid"):
+        img_info = {
+            "valid": True,
+            "format": "jpg",
+            "extension": ".jpg",
+            "mime_type": "image/jpeg",
+            "size": len(data),
+            "width": 0,
+            "height": 0,
+        }
 
-    # placeholders for removed external services
-    detector_result = {"error": "detector_not_configured"}
-    infer_recon = {"error": "inference_recon_not_configured"}
-    infer_patch = {"error": "inference_patch_not_configured"}
+    # 유효한(또는 기본값) 이미지 정보 로깅
+    print(
+        f"📸 이미지 수신: {filename} ({img_info['width']}x{img_info['height']}, format={img_info.get('format')}, size={img_info['size']} bytes)"
+    )
 
     # Run internal scratch pipeline if available
     scratch_result = {"skipped": True, "reason": "scratch_pipeline_not_configured"}
@@ -349,6 +417,28 @@ def process_image(
             # try path first, then array
             try:
                 result, result_image = _SCRATCH_PIPELINE.process_image(tmp_path)
+                import cv2
+
+                # Save the result image to disk
+                out_path = os.path.join(os.getcwd(), "output.jpg")
+                cv2.imwrite(out_path, result_image)
+
+                # Try to open with the default OS image viewer (works for local desktop)
+                try:
+                    if sys.platform.startswith("win"):
+                        os.startfile(out_path)
+                    elif sys.platform == "darwin":
+                        import subprocess
+
+                        subprocess.Popen(["open", out_path])
+                    else:
+                        import subprocess
+
+                        subprocess.Popen(["xdg-open", out_path])
+                except Exception:
+                    # ignore viewer errors in headless/server environments
+                    pass
+
             except Exception as e_path:
                 try:
                     pil_img = Image.open(tmp_path).convert("RGB")
@@ -418,7 +508,7 @@ def process_image(
                         with open(debug_img_path, "wb") as df:
                             df.write(bytes_img)
                         wrote = True
-                        print(f"[DEBUG] saved scratch result image to {debug_img_path}")
+                        print(f"[DEBUG] saved scratch result image")
                     except Exception:
                         wrote = False
 
@@ -428,7 +518,7 @@ def process_image(
 
                         _cv2_save.imwrite(debug_img_path, result_image)
                         wrote = True
-                        print(f"[DEBUG] saved scratch result image via cv2 to {debug_img_path}")
+                        print(f"[DEBUG] saved scratch result image via cv2")
                     except Exception:
                         try:
                             bio2 = io.BytesIO()
@@ -436,7 +526,7 @@ def process_image(
                             with open(debug_img_path, "wb") as df2:
                                 df2.write(bio2.getvalue())
                             wrote = True
-                            print(f"[DEBUG] saved scratch result image via PIL to {debug_img_path}")
+                            print(f"[DEBUG] saved scratch result image via PIL")
                         except Exception as e_save:
                             print(f"[DEBUG] failed to write scratch result image: {e_save}")
 
@@ -457,7 +547,7 @@ def process_image(
             except Exception:
                 pass
     except Exception as e:
-        scratch_result = {"error": "scratch_detection_exception", "detail": str(e)}
+        scratch_result = {"error": "detection_exception", "detail": str(e)}
 
     overall_result = "ok"
     try:
@@ -468,9 +558,7 @@ def process_image(
 
     return {
         "result": overall_result,
-        "detector": detector_result,
-        "inference": {"reconstruct": infer_recon, "patchcore": infer_patch},
-        "scratch_detection": scratch_result,
+        "detection": scratch_result,
         "timestamp": datetime.now().isoformat(),
     }
 
