@@ -320,6 +320,7 @@ class AnomalyDetectionPipeline:
         # 클래스별 임계값 (없으면 기본 anomaly_threshold 사용)
         self.class_anomaly_thresholds = {
             1: float("inf"),  # car: PatchCore로 결함 판단하지 않음
+            3: float("inf"),  # car_floor: PatchCore로 결함 판단하지 않음
             4: float("inf"),  # car_housing: PatchCore로 결함 판단하지 않음
         }
 

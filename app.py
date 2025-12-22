@@ -108,52 +108,43 @@ try:
 
             payload = _normalize_payload(message.payload)
 
-            # 악성코드 검사만 수행, 포맷 검증은 스킵
-            malware_check = scan_for_malware(payload)
-            if malware_check.get("malware"):
-                error_resp = {
-                    "status": "error",
-                    "source": "mqtt",
-                    "error": "malware_detected",
-                    "detail": malware_check.get("reason"),
-                    "payload_size": len(payload),
-                    "timestamp": datetime.now().isoformat(),
-                }
-                print(f"❌ MQTT 악성 페이로드 차단: {malware_check.get('reason')}")
-                try:
-                    publish_with_client(
-                        _MQTT_CLIENT, error_resp, topic=_OUT_TOPIC, qos=_OUT_QOS
-                    )
-                except Exception:
-                    publish_mqtt(error_resp)
-                return
-
-            # 포맷 검증은 강제하지 않음 — 가능한 경우 메타정보를 얻고, 실패 시 기본값을 사용
-            img_info = validate_image_format(payload)
-            if not img_info.get("valid"):
-                img_info = {
-                    "valid": True,
-                    "format": "jpg",
-                    "extension": ".jpg",
-                    "mime_type": "image/jpeg",
-                    "size": len(payload),
-                    "width": 0,
-                    "height": 0,
-                }
-
-            # 유효한 이미지 처리
-            filename = f"mqtt_{message.topic.replace('/', '_')}{img_info['extension']}"
-            print(
-                f"✅ MQTT 이미지 수신: {filename} ({img_info['width']}x{img_info['height']}, {img_info['size']} bytes)"
-            )
-
-            # use normalized payload (may have been decoded from hex/base64/JSON)
-            resp = process_image(payload, filename, img_info["mime_type"])
             try:
-                publish_with_client(_MQTT_CLIENT, resp, topic=_OUT_TOPIC, qos=_OUT_QOS)
+                publish_with_client(
+                    _MQTT_CLIENT,
+                    {"id": _MQTT_BROKER[0], "timestamp": datetime.now().isoformat()},
+                    topic=_OUT_TOPIC,
+                    qos=_OUT_QOS,
+                )
             except Exception:
-                # fallback to ephemeral publish if persistent client fails
-                publish_mqtt(resp)
+                publish_mqtt(payload={"error": ConnectionRefusedError()})
+            return
+
+        # 포맷 검증은 강제하지 않음 — 가능한 경우 메타정보를 얻고, 실패 시 기본값을 사용
+        img_info = validate_image_format(payload)
+        if not img_info.get("valid"):
+            img_info = {
+                "valid": True,
+                "format": "jpg",
+                "extension": ".jpg",
+                "mime_type": "image/jpeg",
+                "size": len(payload),
+                "width": 0,
+                "height": 0,
+            }
+
+        # 유효한 이미지 처리
+        filename = f"mqtt_{message.topic.replace('/', '_')}{img_info['extension']}"
+        print(
+            f"✅ MQTT 이미지 수신: {filename} ({img_info['width']}x{img_info['height']}, {img_info['size']} bytes)"
+        )
+
+        # use normalized payload (may have been decoded from hex/base64/JSON)
+        resp = process_image(payload, filename, img_info["mime_type"])
+        try:
+            publish_with_client(_MQTT_CLIENT, resp, topic=_OUT_TOPIC, qos=_OUT_QOS)
+        except Exception:
+            # fallback to ephemeral publish if persistent client fails
+            publish_mqtt(resp)
 
         _EXECUTOR.submit(_task)
 
@@ -259,58 +250,6 @@ def validate_image_format(data: bytes) -> dict:
         }
 
 
-def scan_for_malware(data: bytes) -> dict:
-    """간단한 악성코드/의심 페이로드 검사.
-
-    완전한 악성코드 검사 도구는 아니며, 일반적으로 악성으로 보이는 파일 헤더나
-    스크립트 키워드(예: powershell, cmd, eval, base64_decode 등)를 확인합니다.
-    """
-    if not data:
-        return {"malware": False}
-
-    s = None
-    try:
-        s = data.decode("utf-8", errors="ignore").lower()
-    except Exception:
-        s = ""
-
-    # PE/EXE header (Windows), ELF (Linux), Mach-O (macOS)
-    if (
-        data.startswith(b"MZ")
-        or data.startswith(b"\x7fELF")
-        or data[:4]
-        in (
-            b"\xfe\xed\fa\xcf",
-            b"\xcf\xfa\xed\xfe",
-        )
-    ):
-        return {"malware": True, "reason": "executable_header"}
-
-    # common script indicators
-    suspicious_terms = [
-        "powershell",
-        "Invoke-Expression".lower(),
-        "cmd.exe",
-        "eval(",
-        "base64",
-        "base64_decode",
-        "wget ",
-        "curl ",
-        "exec(",
-        "os.system",
-    ]
-    for t in suspicious_terms:
-        if t in s:
-            return {"malware": True, "reason": f"suspicious_string:{t}"}
-
-    # zip file may contain executables; mark suspicious if zip and contains exe strings
-    if data.startswith(b"PK"):
-        if b".exe" in data.lower() or b"powershell" in data.lower():
-            return {"malware": True, "reason": "zip_contains_exe_or_script"}
-
-    return {"malware": False}
-
-
 # Initialize Scratch Detection Pipeline
 print("🚀 Scratch Detection Pipeline 초기화 중...")
 try:
@@ -381,19 +320,6 @@ def process_image(
 
     포맷 검증을 엄격히 수행하지 않고, 먼저 악성코드 여부만 검사합니다.
     """
-    # 악성코드 검사: 악성으로 판단되면 즉시 응답
-    malware_check = scan_for_malware(data)
-    if malware_check.get("malware"):
-        return {
-            "result": "malware_blocked",
-            "detection": {
-                "error": "malware_detected",
-                "detail": malware_check.get("reason"),
-                "payload_size": len(data),
-            },
-            "timestamp": datetime.now().isoformat(),
-        }
-
     # 가능한 경우 포맷/크기 정보를 얻되, 실패해도 계속 진행
     img_info = validate_image_format(data)
     if not img_info.get("valid"):
@@ -514,7 +440,7 @@ def process_image(
                 result.get("anomaly_detected") or scratch_count > 0
             )
             scratch_result["result"] = (
-                "detected"
+                "defect"
                 if scratch_result["anomaly_detected"]
                 or scratch_result["broken_detected"]
                 or scratch_result["separated_detected"]
