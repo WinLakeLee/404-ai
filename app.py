@@ -20,14 +20,13 @@ import threading
 from datetime import datetime
 import time
 from dotenv import load_dotenv
-from patchcore import AnomalyDetectionPipeline
+from pipeline import Pipeline
 import tempfile
 import numpy as np
 from PIL import Image
 import io
 import re
 import base64
-import json
 
 # Load environment variables from .env (or DOTENV_PATH) before reading any settings
 load_dotenv(dotenv_path=os.environ.get("DOTENV_PATH", ".env"), override=True)
@@ -58,7 +57,7 @@ _MQTT_CLIENT = None
 try:
 
     def _on_message(client, userdata, message):
-        # delegate processing to executor
+ 
         def _task():
             # Normalize/decode MQTT payload (handle hex, JSON with base64, raw base64)
             def _normalize_payload(data: bytes) -> bytes:
@@ -108,6 +107,7 @@ try:
 
             payload = _normalize_payload(message.payload)
 
+            # Optional ACK/heartbeat to indicate message received
             try:
                 publish_with_client(
                     _MQTT_CLIENT,
@@ -117,34 +117,33 @@ try:
                 )
             except Exception:
                 publish_mqtt(payload={"error": ConnectionRefusedError()})
-            return
 
-        # 포맷 검증은 강제하지 않음 — 가능한 경우 메타정보를 얻고, 실패 시 기본값을 사용
-        img_info = validate_image_format(payload)
-        if not img_info.get("valid"):
-            img_info = {
-                "valid": True,
-                "format": "jpg",
-                "extension": ".jpg",
-                "mime_type": "image/jpeg",
-                "size": len(payload),
-                "width": 0,
-                "height": 0,
-            }
+            # 포맷 검증은 강제하지 않음 — 가능한 경우 메타정보를 얻고, 실패 시 기본값을 사용
+            img_info = validate_image_format(payload)
+            if not img_info.get("valid"):
+                img_info = {
+                    "valid": True,
+                    "format": "jpg",
+                    "extension": ".jpg",
+                    "mime_type": "image/jpeg",
+                    "size": len(payload),
+                    "width": 0,
+                    "height": 0,
+                }
 
-        # 유효한 이미지 처리
-        filename = f"mqtt_{message.topic.replace('/', '_')}{img_info['extension']}"
-        print(
-            f"✅ MQTT 이미지 수신: {filename} ({img_info['width']}x{img_info['height']}, {img_info['size']} bytes)"
-        )
+            # 유효한 이미지 처리
+            filename = f"mqtt_{message.topic.replace('/', '_')}{img_info['extension']}"
+            print(
+                f"✅ MQTT 이미지 수신: {filename} ({img_info['width']}x{img_info['height']}, {img_info['size']} bytes)"
+            )
 
-        # use normalized payload (may have been decoded from hex/base64/JSON)
-        resp = process_image(payload, filename, img_info["mime_type"])
-        try:
-            publish_with_client(_MQTT_CLIENT, resp, topic=_OUT_TOPIC, qos=_OUT_QOS)
-        except Exception:
-            # fallback to ephemeral publish if persistent client fails
-            publish_mqtt(resp)
+            # use normalized payload (may have been decoded from hex/base64/JSON)
+            resp = process_image(payload, filename, img_info["mime_type"])
+            try:
+                publish_with_client(_MQTT_CLIENT, resp, topic=_OUT_TOPIC, qos=_OUT_QOS)
+            except Exception:
+                # fallback to ephemeral publish if persistent client fails
+                publish_mqtt(resp)
 
         _EXECUTOR.submit(_task)
 
@@ -250,21 +249,24 @@ def validate_image_format(data: bytes) -> dict:
         }
 
 
-# Initialize Scratch Detection Pipeline
+# Initialize Scratch Detection Pipeline (configurable backends)
 print("🚀 Scratch Detection Pipeline 초기화 중...")
 try:
-    _SCRATCH_PIPELINE = AnomalyDetectionPipeline(
-        yolo_model_path=os.environ.get(
-            "YOLO_MODEL_PATH",
-            os.path.join("models", "yolo_weights", "best.pt"),
-        ),
-        patchcore_checkpoint=os.environ.get(
-            "PATCHCORE_CHECKPOINT",
-            os.path.join("models", "patch_core"),
-        ),
+    _SCRATCH_PIPELINE = Pipeline(
+        det_backend=os.environ.get("DETECTION_BACKEND", "yolo"),
+        anomaly_backend=os.environ.get("ANOMALY_BACKEND", "patchcore"),
         device=os.environ.get("DEVICE", "cuda"),
-        conf_threshold=float(os.environ.get("YOLO_CONF_THRESHOLD", 0.25)),
+        det_conf=float(os.environ.get("DETECTION_CONF", 0.25)),
+        det_imgsz=int(os.environ.get("DETECTION_IMGSZ", 640)),
+        yolo_model=os.environ.get(
+            "YOLO_MODEL_PATH", os.path.join("models", "yolo_weights", "best.pt")
+        ),
+        sam_model=os.environ.get("SAM_MODEL_PATH", "FastSAM-s.pt"),
+        sam_prompt=os.environ.get("SAM_PROMPT", "car"),
         anomaly_threshold=float(os.environ.get("ANOMALY_THRESHOLD", 33.08)),
+        patchcore_ckpt=os.environ.get(
+            "PATCHCORE_CHECKPOINT", os.path.join("models", "patch_core")
+        ),
     )
     print("✅ Scratch Detection Pipeline 준비 완료!")
 except Exception as e:
@@ -536,7 +538,7 @@ def detect():
         return jsonify({"error": "empty filename"}), 400
 
     data = file.read()
-    resp = process_image(data, filename=file.filename, mimetype=file.mimetype)
+    resp = process_image(data, filename=file.filename or datetime.now().isoformat(), mimetype=file.mimetype)
     if _MQTT_CLIENT is not None:
         try:
             publish_with_client(_MQTT_CLIENT, resp, topic=_OUT_TOPIC, qos=_OUT_QOS)
