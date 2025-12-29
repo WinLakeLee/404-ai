@@ -139,10 +139,14 @@ try:
 
             # use normalized payload (may have been decoded from hex/base64/JSON)
             resp = process_image(payload, filename, img_info["mime_type"])
-            try:
-                publish_with_client(_MQTT_CLIENT, resp, topic=_OUT_TOPIC, qos=_OUT_QOS)
-            except Exception:
-                # fallback to ephemeral publish if persistent client fails
+            # result가 'pass'가 아니면 publish
+            if resp.get("detection", {}).get("result") != "pass":
+                try:
+                    publish_with_client(_MQTT_CLIENT, resp, topic=_OUT_TOPIC, qos=_OUT_QOS)
+                except Exception:
+                    # fallback to ephemeral publish if persistent client fails
+                    publish_mqtt(resp)
+            else:
                 publish_mqtt(resp)
 
         _EXECUTOR.submit(_task)
@@ -366,29 +370,41 @@ def process_image(
             img_base64 = base64.b64encode(bytes_img).decode("utf-8") if bytes_img else ""
             # 결과 집계
             car_regions = results if isinstance(results, list) else []
-            scratch_count = sum(
-                1 for r in car_regions if r.get("class_id") == 5
-            )
-            broken_count = 0  # 필요시 클래스별로 집계
-            separated_count = sum(
-                1 for r in car_regions if r.get("class_id") == 6
-            )
-            scratch_result = {
-                "success": True,
-                "result_image": f"data:image/jpeg;base64,{img_base64}",
-                "scratch_detected": bool(scratch_count),
-                "broken_detected": bool(broken_count),
-                "separated_detected": bool(separated_count),
-                "anomaly_detected": bool(scratch_count),
-                "scratch_count": scratch_count,
-                "broken_count": broken_count,
-                "separated_count": separated_count,
-                "car_regions": car_regions,
-                "result": (
-                    "defect" if scratch_count > 0 else "ok"
-                ),
-            }
-            print(f"[DEBUG] pipeline summary: scratch_count={scratch_count}")
+            # 자동차(cls=1,2)가 감지되지 않으면 pass 처리
+            car_detected = any(r.get("class_id") in (1, 2) for r in car_regions)
+            if not car_detected:
+                scratch_result = {
+                    "success": False,
+                    "result_image": f"data:image/jpeg;base64,{img_base64}",
+                    "car_regions": car_regions,
+                    "result": "pass",
+                    "reason": "no car (cls=1,2) detected"
+                }
+                print("[DEBUG] pipeline summary: no car (cls=1,2) detected, pass")
+            else:
+                scratch_count = sum(
+                    1 for r in car_regions if r.get("class_id") == 5
+                )
+                broken_count = 0  # 필요시 클래스별로 집계
+                separated_count = sum(
+                    1 for r in car_regions if r.get("class_id") == 6
+                )
+                scratch_result = {
+                    "success": True,
+                    "result_image": f"data:image/jpeg;base64,{img_base64}",
+                    "scratch_detected": bool(scratch_count),
+                    "broken_detected": bool(broken_count),
+                    "separated_detected": bool(separated_count),
+                    "anomaly_detected": bool(scratch_count),
+                    "scratch_count": scratch_count,
+                    "broken_count": broken_count,
+                    "separated_count": separated_count,
+                    "car_regions": car_regions,
+                    "result": (
+                        "defect" if scratch_count > 0 else "ok"
+                    ),
+                }
+                print(f"[DEBUG] pipeline summary: scratch_count={scratch_count}")
             try:
                 os.unlink(tmp_path)
             except Exception:
@@ -433,13 +449,15 @@ def detect():
         filename=file.filename or datetime.now().isoformat(),
         mimetype=file.mimetype,
     )
-    if _MQTT_CLIENT is not None:
-        try:
-            publish_with_client(_MQTT_CLIENT, resp, topic=_OUT_TOPIC, qos=_OUT_QOS)
-        except Exception:
+    # result가 'pass'가 아니면 publish
+    if resp.get("detection", {}).get("result") != "pass":
+        if _MQTT_CLIENT is not None:
+            try:
+                publish_with_client(_MQTT_CLIENT, resp, topic=_OUT_TOPIC, qos=_OUT_QOS)
+            except Exception:
+                publish_mqtt(resp)
+        else:
             publish_mqtt(resp)
-    else:
-        publish_mqtt(resp)
     return jsonify(resp)
 
 

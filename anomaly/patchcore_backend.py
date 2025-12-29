@@ -146,7 +146,10 @@ class PatchCoreBackend:
         self.device = torch.device(device if torch.cuda.is_available() else "cpu")
         self.anomaly_threshold = anomaly_threshold
 
-        checkpoint_dir = Path(checkpoint_dir)
+        if checkpoint_dir is None:
+            raise ValueError("checkpoint_dir must not be None")
+        if not isinstance(checkpoint_dir, Path):
+            checkpoint_dir = Path(str(checkpoint_dir))
         memory_bank_path = checkpoint_dir / "memory_bank.npy"
         meta_path = checkpoint_dir / "meta.json"
         if not memory_bank_path.exists():

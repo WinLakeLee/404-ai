@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import List, Dict, Optional
 
 import cv2
+from _logger_ import DailyLogger
 
 from detection.yolo_detector import YOLODetector
 from detection.sam_detector import SAMDetector
@@ -101,17 +102,24 @@ class Pipeline:
             anomaly_threshold=anomaly_threshold,
         )
         self.anomaly_threshold = anomaly_threshold
+        self.logger = DailyLogger(log_dir="logs", log_prefix="pipeline")
 
     def run_image(self, image_path: Path, save_path: Optional[Path] = None):
-        print(f"\n[Input] {image_path}")
+        self.logger.log(f"[Input] {image_path}")
         image = cv2.imread(str(image_path))
         if image is None:
+            self.logger.log(f"이미지를 로드할 수 없습니다: {image_path}", level="error")
             raise ValueError(f"이미지를 로드할 수 없습니다: {image_path}")
 
+        # 1. YOLO 탐색
         regions = self.detector.detect(image_path)
-        print(f" Detected regions: {len(regions)}")
+        self.logger.log(f"Detected regions: {len(regions)}")
 
-        # class_id별 색상 및 이름 매핑
+        # 2. toy_car(class_id=1,2) 존재 여부 판단
+        toy_car_exists = any(reg.get("class_id") in (1, 2) for reg in regions)
+        self.logger.log(f"[STEP] toy_car exists: {toy_car_exists}")
+
+        # 3. anomaly 탐색 (toy_car 있을 때만)
         class_colors = {
             0: (0, 255, 0),    # green
             1: (0, 0, 255),    # red
@@ -134,7 +142,7 @@ class Pipeline:
                 "anomaly": None,
             }
 
-            if self.anomaly and (
+            if toy_car_exists and self.anomaly and (
                 self.anomaly_backend == "patchcore"
                 or self.anomaly_backend == "efficientad"
             ):
@@ -143,9 +151,9 @@ class Pipeline:
                 )
                 out["anomaly"] = anomaly
                 tag = "DEFECT" if anomaly["is_anomaly"] else "OK"
-                print(f"  [{i}] cls={cls_id} score={anomaly['score']:.2f} -> {tag}")
+                self.logger.log(f"[{i}] cls={cls_id} score={anomaly['score']:.2f} -> {tag}")
             else:
-                print(f"  [{i}] cls={cls_id} (anomaly backend skipped)")
+                self.logger.log(f"[{i}] cls={cls_id} (anomaly backend skipped)")
 
             results.append(out)
 
@@ -190,18 +198,23 @@ class Pipeline:
         if save_path:
             save_path.parent.mkdir(parents=True, exist_ok=True)
             cv2.imwrite(str(save_path), image)
-            print(f" Saved: {save_path}")
+            self.logger.log(f"Saved: {save_path}")
         else:
             cv2.imshow("result", image)
             cv2.waitKey(1)
 
+        # 결과를 날짜별 파일에 자동 저장
+        self.logger.save_result({
+            "image": str(image_path),
+            "results": results
+        })
         return results
 
     def run_directory(self, source_dir: Path, save_dir: Optional[Path] = None):
         exts = {".jpg", ".jpeg", ".png", ".bmp"}
         images = sorted([p for p in source_dir.iterdir() if p.suffix.lower() in exts])
         if not images:
-            print(f"❌ 디렉토리에 이미지가 없습니다: {source_dir}")
+            self.logger.log(f"❌ 디렉토리에 이미지가 없습니다: {source_dir}", level="error")
             return
         for img in images:
             out = save_dir / img.name if save_dir else None
