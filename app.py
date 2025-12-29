@@ -142,7 +142,9 @@ try:
             # result가 'pass'가 아니면 publish
             if resp.get("detection", {}).get("result") != "pass":
                 try:
-                    publish_with_client(_MQTT_CLIENT, resp, topic=_OUT_TOPIC, qos=_OUT_QOS)
+                    publish_with_client(
+                        _MQTT_CLIENT, resp, topic=_OUT_TOPIC, qos=_OUT_QOS
+                    )
                 except Exception:
                     # fallback to ephemeral publish if persistent client fails
                     publish_mqtt(resp)
@@ -343,21 +345,25 @@ def process_image(
         f"📸 이미지 수신: {filename} ({img_info['width']}x{img_info['height']}, format={img_info.get('format')}, size={img_info['size']} bytes)"
     )
 
-
     # 실제 감지(inference) 수행
-    if '_SCRATCH_PIPELINE' in globals() and _SCRATCH_PIPELINE is not None:
+    if "_SCRATCH_PIPELINE" in globals() and _SCRATCH_PIPELINE is not None:
         try:
             # 임시 파일로 저장 후 run_image 사용
-            with tempfile.NamedTemporaryFile(suffix=img_info["extension"], delete=False) as tmp:
+            with tempfile.NamedTemporaryFile(
+                suffix=img_info["extension"], delete=False
+            ) as tmp:
                 tmp.write(data)
                 tmp_path = tmp.name
             # 결과 이미지 저장 경로 (디버그용)
             debug_dir = os.path.join(os.getcwd(), "debug")
             os.makedirs(debug_dir, exist_ok=True)
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            debug_img_path = os.path.join(debug_dir, f"scratch_result_{ts}.jpg")
+            # 파일명에 원본 이미지 이름(확장자 제거) 추가하여 중복 방지
+            base_name = os.path.splitext(filename)[0]
+            debug_img_path = os.path.join(debug_dir, f"scratch_result_{ts}_{base_name}.jpg")
             # 감지 수행
             from pathlib import Path
+
             results = _SCRATCH_PIPELINE.run_image(Path(tmp_path), Path(debug_img_path))
             # results: List[Dict], 시각화 이미지는 debug_img_path에 저장됨
             # 결과 이미지 base64 인코딩
@@ -367,7 +373,9 @@ def process_image(
                     bytes_img = f.read()
             except Exception:
                 bytes_img = b""
-            img_base64 = base64.b64encode(bytes_img).decode("utf-8") if bytes_img else ""
+            img_base64 = (
+                base64.b64encode(bytes_img).decode("utf-8") if bytes_img else ""
+            )
             # 결과 집계
             car_regions = results if isinstance(results, list) else []
             # 자동차(cls=1,2)가 감지되지 않으면 pass 처리
@@ -378,17 +386,13 @@ def process_image(
                     "result_image": f"data:image/jpeg;base64,{img_base64}",
                     "car_regions": car_regions,
                     "result": "pass",
-                    "reason": "no car (cls=1,2) detected"
+                    "reason": "no car (cls=1,2) detected",
                 }
                 print("[DEBUG] pipeline summary: no car (cls=1,2) detected, pass")
             else:
-                scratch_count = sum(
-                    1 for r in car_regions if r.get("class_id") == 5
-                )
+                scratch_count = sum(1 for r in car_regions if r.get("class_id") == 5)
                 broken_count = 0  # 필요시 클래스별로 집계
-                separated_count = sum(
-                    1 for r in car_regions if r.get("class_id") == 6
-                )
+                separated_count = sum(1 for r in car_regions if r.get("class_id") == 6)
                 scratch_result = {
                     "success": True,
                     "result_image": f"data:image/jpeg;base64,{img_base64}",
@@ -400,9 +404,7 @@ def process_image(
                     "broken_count": broken_count,
                     "separated_count": separated_count,
                     "car_regions": car_regions,
-                    "result": (
-                        "defect" if scratch_count > 0 else "ok"
-                    ),
+                    "result": ("defect" if scratch_count > 0 else "ok"),
                 }
                 print(f"[DEBUG] pipeline summary: scratch_count={scratch_count}")
             try:
@@ -439,26 +441,68 @@ def detect():
     if "image" not in request.files:
         return jsonify({"error": "no image file provided"}), 400
 
-    file = request.files["image"]
-    if file.filename == "":
-        return jsonify({"error": "empty filename"}), 400
-
-    data = file.read()
-    resp = process_image(
-        data,
-        filename=file.filename or datetime.now().isoformat(),
-        mimetype=file.mimetype,
-    )
-    # result가 'pass'가 아니면 publish
-    if resp.get("detection", {}).get("result") != "pass":
-        if _MQTT_CLIENT is not None:
-            try:
-                publish_with_client(_MQTT_CLIENT, resp, topic=_OUT_TOPIC, qos=_OUT_QOS)
-            except Exception:
-                publish_mqtt(resp)
+    files = request.files.getlist("image")
+    result_images = []
+    total_scratch_count = 0
+    total_broken_count = 0
+    total_separated_count = 0
+    total_car_regions = []
+    detected_any = False
+    reasons = []
+    for file in files:
+        if file.filename == "":
+            continue
+        data = file.read()
+        resp = process_image(
+            data,
+            filename=file.filename or datetime.now().isoformat(),
+            mimetype=file.mimetype,
+        )
+        det = resp.get("detection", {})
+        car_regions = det.get("car_regions", [])
+        # car_regions가 없으면 이 이미지는 완전히 무시
+        if not car_regions:
+            continue
+        # result_image만 리스트로 모음 (항상 prefix 보장)
+        img = det.get("result_image")
+        if img:
+            if not img.startswith("data:image/jpeg;base64,"):
+                img = f"data:image/jpeg;base64,{img.lstrip()}"
+            result_images.append(img)
         else:
-            publish_mqtt(resp)
-    return jsonify(resp)
+            result_images.append("")
+        # count 합산
+        total_scratch_count += det.get("scratch_count", 0)
+        total_broken_count += det.get("broken_count", 0)
+        total_separated_count += det.get("separated_count", 0)
+        total_car_regions.extend(car_regions)
+        if det.get("result") != "pass":
+            detected_any = True
+        if "reason" in det:
+            reasons.append(det["reason"])
+        # result가 'pass'가 아니면 publish
+        if det.get("result") != "pass":
+            if _MQTT_CLIENT is not None:
+                try:
+                    publish_with_client(
+                        _MQTT_CLIENT, resp, topic=_OUT_TOPIC, qos=_OUT_QOS
+                    )
+                except Exception:
+                    publish_mqtt(resp)
+            else:
+                publish_mqtt(resp)
+    # 최종 응답 dict 구성
+    response = {
+        "result": "defect" if detected_any else "ok",
+        "scratch_count": total_scratch_count,
+        "broken_count": total_broken_count,
+        "separated_count": total_separated_count,
+        "result_image": result_images,
+        "car_regions": total_car_regions,
+        "reason": "; ".join(reasons) if reasons else None,
+        "timestamp": datetime.now().isoformat(),
+    }
+    return jsonify(response)
 
 
 if __name__ == "__main__":
