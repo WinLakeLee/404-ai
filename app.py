@@ -438,10 +438,31 @@ def process_image(
 
 @app.route("/detect", methods=["POST"])
 def detect():
-    if "image" not in request.files:
-        return jsonify({"error": "no image file provided"}), 400
+    # JSON 방식 지원: images: [{image: ...}, ...]
+    images = []
+    if request.is_json:
+        req_json = request.get_json()
+        images = req_json.get("images", [])
+        # images가 없으면 에러
+        if not images:
+            return jsonify({"error": "no images in JSON payload"}), 400
+        def get_image_bytes(imgobj):
+            b64 = imgobj.get("image", "")
+            if b64.startswith("data:") and "base64," in b64:
+                b64 = b64.split("base64,", 1)[1]
+            try:
+                return base64.b64decode(b64)
+            except Exception:
+                return b""
+        image_datas = [(get_image_bytes(img), f"json_image_{i}.png") for i, img in enumerate(images)]
+    elif "image" in request.files:
+        files = request.files.getlist("image")
+        image_datas = [(file.read(), file.filename or datetime.now().isoformat()) for file in files if file.filename != ""]
+        if not image_datas:
+            return jsonify({"error": "no image file provided"}), 400
+    else:
+        return jsonify({"error": "no image data provided"}), 400
 
-    files = request.files.getlist("image")
     result_images = []
     total_scratch_count = 0
     total_broken_count = 0
@@ -449,14 +470,13 @@ def detect():
     total_car_regions = []
     detected_any = False
     reasons = []
-    for file in files:
-        if file.filename == "":
+    for data, fname in image_datas:
+        if not data:
             continue
-        data = file.read()
         resp = process_image(
             data,
-            filename=file.filename or datetime.now().isoformat(),
-            mimetype=file.mimetype,
+            filename=fname,
+            mimetype=None,
         )
         det = resp.get("detection", {})
         car_regions = det.get("car_regions", [])
