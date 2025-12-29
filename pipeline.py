@@ -15,11 +15,20 @@ import cv2
 from detection.yolo_detector import YOLODetector
 from detection.sam_detector import SAMDetector
 from anomaly.patchcore_backend import PatchCoreBackend
+from anomaly.PDN_backend import PDNBackend
 
 
 class DetectionFactory:
     @staticmethod
-    def create(backend: str, device: str, conf: float, imgsz: int, sam_model: Optional[str], sam_prompt: Optional[str], yolo_model: str):
+    def create(
+        backend: str,
+        device: str,
+        conf: float,
+        imgsz: int,
+        sam_model: Optional[str],
+        sam_prompt: Optional[str],
+        yolo_model: str,
+    ):
         backend = backend.lower()
         if backend == "sam":
             return SAMDetector(
@@ -39,10 +48,21 @@ class DetectionFactory:
 
 class AnomalyFactory:
     @staticmethod
-    def create(backend: str, device: str, patchcore_ckpt: Optional[str], anomaly_threshold: float):
+    def create(
+        backend: str,
+        device: str,
+        patchcore_ckpt: Optional[str],
+        anomaly_threshold: float,
+    ):
         backend = backend.lower()
         if backend == "efficientad":
-            return None  # placeholder
+            return PDNBackend(
+                checkpoint_path=os.path.join(
+                    patchcore_ckpt or "models", "Efficient_AD", "best_checkpoint.pth"
+                ),
+                device=device,
+                anomaly_threshold=anomaly_threshold,
+            )
         return PatchCoreBackend(
             checkpoint_dir=patchcore_ckpt or "models/patch_core",
             device=device,
@@ -91,6 +111,18 @@ class Pipeline:
         regions = self.detector.detect(image_path)
         print(f" Detected regions: {len(regions)}")
 
+        # class_id별 색상 및 이름 매핑
+        class_colors = {
+            0: (0, 255, 0),    # green
+            1: (0, 0, 255),    # red
+            2: (255, 0, 0),    # blue
+            3: (0, 255, 255),  # yellow
+            4: (255, 0, 255),  # magenta
+            5: (255, 255, 0),  # cyan
+            6: (128, 128, 128) # gray
+        }
+        class_names = {5: "scratch", 6: "separated"}
+
         results: List[Dict] = []
         for i, reg in enumerate(regions):
             bbox = reg["bbox"]
@@ -102,8 +134,13 @@ class Pipeline:
                 "anomaly": None,
             }
 
-            if self.anomaly and self.anomaly_backend == "patchcore":
-                anomaly = self.anomaly.predict_crop(image, bbox, threshold=self.anomaly_threshold)
+            if self.anomaly and (
+                self.anomaly_backend == "patchcore"
+                or self.anomaly_backend == "efficientad"
+            ):
+                anomaly = self.anomaly.predict_crop(
+                    image, bbox, threshold=self.anomaly_threshold
+                )
                 out["anomaly"] = anomaly
                 tag = "DEFECT" if anomaly["is_anomaly"] else "OK"
                 print(f"  [{i}] cls={cls_id} score={anomaly['score']:.2f} -> {tag}")
@@ -112,10 +149,44 @@ class Pipeline:
 
             results.append(out)
 
-            # 시각화: 녹색 박스
-            x1, y1, x2, y2 = bbox
-            cv2.rectangle(image, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            # cls=5,6만 bbox 그림
+            if cls_id in (5, 6):
+                x1, y1, x2, y2 = bbox
+                color = class_colors.get(cls_id, (0, 255, 0))
+                cv2.rectangle(image, (x1, y1), (x2, y2), color, 2)
 
+        # legend(범례) 추가: 이미지 우측하단 box, 각 class별 색상/이름
+        h, w = image.shape[:2]
+        legend_w = int(w * 0.3)
+        # legend에 표시할 class만 필터 (cls=5,6만)
+        legend_cls_ids = [cid for cid in (5, 6) if any(reg.get("class_id") == cid for reg in regions)]
+        n_legend = len(legend_cls_ids)
+        if n_legend == 0:
+            n_legend = 1  # 최소 높이 확보
+        line_height = max(h // 20, 18)
+        legend_h = int(line_height * (n_legend + 1.2))  # 표시할 class 수에 따라 세로 크기 자동 조정
+        legend_x1 = w - legend_w - 10
+        legend_y1 = h - legend_h - 10
+        legend_x2 = w - 10
+        legend_y2 = h - 10
+        cv2.rectangle(image, (legend_x1, legend_y1), (legend_x2, legend_y2), (255, 255, 255), -1)  # legend 배경
+        cv2.rectangle(image, (legend_x1, legend_y1), (legend_x2, legend_y2), (0, 0, 0), 2)  # legend 테두리
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        font_scale = (line_height / 32.0) * (2/3)
+        thickness = max(int(font_scale * 2), 1)
+        y_offset = legend_y1 + line_height
+        color_box_w = max(int(line_height * 0.7), 12)
+        color_box_h = max(int(line_height * 0.7), 12)
+        for cid in legend_cls_ids:
+            cname = class_names.get(cid, str(cid))
+            color = class_colors.get(cid, (0, 255, 0))
+            box_y1 = y_offset - color_box_h // 2
+            box_y2 = y_offset + color_box_h // 2 - 1
+            cv2.rectangle(image, (legend_x1 + 15, box_y1), (legend_x1 + 15 + color_box_w, box_y2), color, -1)
+            cv2.putText(image, f"{cname}", (legend_x1 + 25 + color_box_w, y_offset + line_height//3), font, font_scale, (0, 0, 0), thickness)
+            y_offset += line_height
+
+        # regions가 비어 있어도 결과 이미지를 항상 저장
         if save_path:
             save_path.parent.mkdir(parents=True, exist_ok=True)
             cv2.imwrite(str(save_path), image)
@@ -143,17 +214,35 @@ def main():
     parser.add_argument("--source", type=str, help="이미지 디렉토리 경로")
     parser.add_argument("--save-dir", type=str, help="결과 저장 디렉토리")
 
-    parser.add_argument("--det-backend", type=str, choices=["yolo", "sam"], default=os.getenv("DETECTION_BACKEND", "yolo"))
+    parser.add_argument(
+        "--det-backend",
+        type=str,
+        choices=["yolo", "sam"],
+        default=os.getenv("DETECTION_BACKEND", "yolo"),
+    )
     parser.add_argument("--yolo-model", type=str, default="models/yolo_weights/best.pt")
     parser.add_argument("--sam-model", type=str, help="FastSAM 모델 경로")
     parser.add_argument("--sam-prompt", type=str, help="SAM 텍스트 프롬프트")
-    parser.add_argument("--conf", type=float, default=float(os.getenv("DETECTION_CONF", 0.25)))
-    parser.add_argument("--imgsz", type=int, default=int(os.getenv("DETECTION_IMGSZ", 640)))
+    parser.add_argument(
+        "--conf", type=float, default=float(os.getenv("DETECTION_CONF", 0.25))
+    )
+    parser.add_argument(
+        "--imgsz", type=int, default=int(os.getenv("DETECTION_IMGSZ", 640))
+    )
     parser.add_argument("--device", type=str, default=os.getenv("DEVICE", "cuda"))
 
-    parser.add_argument("--anomaly-backend", type=str, choices=["patchcore", "efficientad"], default=os.getenv("ANOMALY_BACKEND", "patchcore"))
+    parser.add_argument(
+        "--anomaly-backend",
+        type=str,
+        choices=["patchcore", "efficientad"],
+        default=os.getenv("ANOMALY_BACKEND", "patchcore"),
+    )
     parser.add_argument("--patchcore-checkpoint", type=str, default="models/patch_core")
-    parser.add_argument("--anomaly-threshold", type=float, default=float(os.getenv("ANOMALY_THRESHOLD", 33.08)))
+    parser.add_argument(
+        "--anomaly-threshold",
+        type=float,
+        default=float(os.getenv("ANOMALY_THRESHOLD", 33.08)),
+    )
 
     args = parser.parse_args()
 

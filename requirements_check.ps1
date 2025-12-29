@@ -113,12 +113,13 @@ except ImportError:
 
 # 패키지 -> 설치 커맨드 매핑 (PyTorch는 별도 로직으로 처리)
 $installMap = @{
-    'Ultralytics' = @{ args = 'install ultralytics==8.1.0' }
+    'Ultralytics' = @{ args = 'install ultralytics==8.3.240' }
+    'Scikit-Learn' = @{ args = 'install scikit-learn==1.3.2' }
     'Paho-MQTT' = @{ args = 'install paho-mqtt==1.6.1' }
     'PIL (Pillow)' = @{ args = 'install pillow==10.1.0' }
-    'OpenCV (cv2)' = @{ args = 'install opencv-python>=4.8.0' }
-    'NumPy' = @{ args = 'install numpy>=1.24.0' }
-    'Matplotlib' = @{ args = 'install matplotlib' }
+    'OpenCV (cv2)' = @{ args = 'install opencv-python==4.12.0.88' }
+    'NumPy' = @{ args = 'install numpy==2.2.6' }
+    'Matplotlib' = @{ args = 'install matplotlib==3.10.8' }
     'python-dotenv' = @{ args = 'install python-dotenv==1.0.0' }
 }
 
