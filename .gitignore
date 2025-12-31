@@ -211,7 +211,9 @@ uploads/
 *.pkl
 *.pth
 *.pt
-*.json
 /debug
-/scripts
-*.jpg
+logs/
+*.log
+
+# keep scripts in repo (use .gitignore if you want to hide helpers)
+# do not ignore all JSON files (some models use meta.json)
