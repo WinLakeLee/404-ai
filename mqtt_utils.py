@@ -1,3 +1,8 @@
+from _daily_logger import DailyLogger
+
+dlogger = DailyLogger()
+
+
 def find_base64_image(data: bytes, max_depth=3) -> bytes:
     """
     여러 번 base64 디코딩을 반복하여 이미지 매직넘버가 나올 때까지 시도
@@ -24,7 +29,7 @@ def find_base64_image(data: bytes, max_depth=3) -> bytes:
         found = []
         for k in keys:
             if k in obj:
-                print(f"[MQTT DEBUG] extract_image_from_dict found key={k}")
+                dlogger.log(f"[MQTT DEBUG] extract_image_from_dict found key={k}", level="debug")
                 v = obj[k]
                 # list of items: items can be strings, bytes, or nested dicts
                 if isinstance(v, list):
@@ -54,7 +59,7 @@ def find_base64_image(data: bytes, max_depth=3) -> bytes:
         if isinstance(val, dict):
             nested = extract_image_from_dict(val)
             if nested:
-                print(f"[MQTT DEBUG] try_parse_image: parsed nested dict, found {len(nested)} images")
+                dlogger.log(f"[MQTT DEBUG] try_parse_image: parsed nested dict, found {len(nested)} images", level="debug")
                 return nested[0]
         if isinstance(val, str):
             s = val.strip()
@@ -62,18 +67,18 @@ def find_base64_image(data: bytes, max_depth=3) -> bytes:
                 s = s.split("base64,", 1)[1]
             try:
                 b = base64.b64decode(s, validate=True)
-                print(f"[MQTT DEBUG] try_parse_image: decoded string -> {len(b)} bytes, head={b[:16].hex()}" )
+                dlogger.log(f"[MQTT DEBUG] try_parse_image: decoded string -> {len(b)} bytes, head={b[:16].hex()}", level="debug")
                 if is_image_bytes(b):
-                    print(f"[MQTT DEBUG] try_parse_image: valid image (w>0,h>0) after decode")
+                    dlogger.log(f"[MQTT DEBUG] try_parse_image: valid image (w>0,h>0) after decode", level="debug")
                     return b
             except Exception:
-                print(f"[MQTT DEBUG] try_parse_image: base64 decode failed for candidate (len={len(s)})")
+                dlogger.log(f"[MQTT DEBUG] try_parse_image: base64 decode failed for candidate (len={len(s)})", level="debug")
                 pass
         # bytes면 바로 확인
         if isinstance(val, bytes):
-            print(f"[MQTT DEBUG] try_parse_image: candidate bytes len={len(val)}, head={val[:16].hex()}")
+            dlogger.log(f"[MQTT DEBUG] try_parse_image: candidate bytes len={len(val)}, head={val[:16].hex()}", level="debug")
             if is_image_bytes(val):
-                print(f"[MQTT DEBUG] try_parse_image: candidate bytes is valid image")
+                dlogger.log(f"[MQTT DEBUG] try_parse_image: candidate bytes is valid image", level="debug")
                 return val
         return None
 
@@ -82,7 +87,7 @@ def find_base64_image(data: bytes, max_depth=3) -> bytes:
         # 1. bytes가 이미지면 리스트로 반환
         try:
             if is_image_bytes(current):
-                print(f"[MQTT DEBUG] find_base64_image: input is image bytes ({len(current)} bytes), head={current[:16].hex()}")
+                dlogger.log(f"[MQTT DEBUG] find_base64_image: input is image bytes ({len(current)} bytes), head={current[:16].hex()}", level="debug")
                 return {"image": current}
         except Exception:
             pass
@@ -100,20 +105,20 @@ def find_base64_image(data: bytes, max_depth=3) -> bytes:
                             else:
                                 return {"image": found}
                 except Exception:
-                    print("[MQTT DEBUG] JSON loads failed during payload parse")
+                    dlogger.log("[MQTT DEBUG] JSON loads failed during payload parse", level="debug")
                     pass
         except Exception:
-            print("[MQTT DEBUG] find_base64_image: decode to text failed or not JSON")
+            dlogger.log("[MQTT DEBUG] find_base64_image: decode to text failed or not JSON", level="debug")
             pass
         # 3. base64 디코딩 반복
         try:
             s = current.decode("utf-8", errors="ignore").strip()
             b64 = s.split("base64,", 1)[1] if "base64," in s else s
-            print(f"[MQTT DEBUG] find_base64_image: attempting base64 decode on len={len(b64)}")
+            dlogger.log(f"[MQTT DEBUG] find_base64_image: attempting base64 decode on len={len(b64)}", level="debug")
             current = base64.b64decode(b64, validate=True)
-            print(f"[MQTT DEBUG] find_base64_image: decoded -> {len(current)} bytes, head={current[:16].hex()}")
+            dlogger.log(f"[MQTT DEBUG] find_base64_image: decoded -> {len(current)} bytes, head={current[:16].hex()}", level="debug")
         except Exception:
-            print("[MQTT DEBUG] find_base64_image: iterative base64 decode failed — stopping")
+            dlogger.log("[MQTT DEBUG] find_base64_image: iterative base64 decode failed — stopping", level="debug")
             break
     # 실패 시 빈 리스트 반환
     return {"image": []}
@@ -459,7 +464,7 @@ def is_client_connected(mqtt_client) -> bool:
 if __name__ == '__main__':
     # Basic demo: start Flask-MQTT for a few seconds to check callbacks.
     logging.basicConfig(level=logging.INFO)
-    print('Starting MQTT subscriber demo (will run ~5s)')
+    dlogger.log('Starting MQTT subscriber demo (will run ~5s)', level="info")
     mqtt_client = None
     try:
         try:
@@ -490,4 +495,4 @@ if __name__ == '__main__':
                         pass
         except Exception:
             pass
-    print('Demo finished')
+    dlogger.log('Demo finished', level="info")

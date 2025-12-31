@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import List, Dict, Optional
 
 import cv2
-from _logger_ import DailyLogger
+from _daily_logger import DailyLogger
 
 from detection.yolo_detector import YOLODetector
 from detection.sam_detector import SAMDetector

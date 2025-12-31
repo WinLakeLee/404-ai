@@ -1,6 +1,9 @@
 import pyrealsense2 as rs
 import numpy as np
 import cv2
+from _daily_logger import DailyLogger
+
+dlogger = DailyLogger()
 
 # 1. 파이프라인 설정 (카메라 연결 준비)
 pipeline = rs.pipeline()
@@ -13,7 +16,7 @@ config.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, 30)
 config.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
 
 # 3. 카메라 시작
-print("카메라를 시작합니다... (종료하려면 화면을 클릭하고 'q'를 누르세요)")
+dlogger.log("카메라를 시작합니다... (종료하려면 화면을 클릭하고 'q'를 누르세요)", level="info")
 pipeline.start(config)
 
 try:

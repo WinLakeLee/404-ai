@@ -27,12 +27,14 @@ from PIL import Image
 import io
 import re
 import base64
+from _daily_logger import DailyLogger
 
 # Load environment variables from .env (or DOTENV_PATH) before reading any settings
 load_dotenv(dotenv_path=os.environ.get("DOTENV_PATH", ".env"), override=True)
 
 app = Flask(__name__)
 _EXECUTOR = ThreadPoolExecutor(max_workers=int(os.environ.get("APP_WORKERS", 4)))
+dlogger = DailyLogger()
 
 # MQTT settings (single broker for pub/sub)
 _MQTT_BROKER = os.environ.get("MQTT_BROKER") or "localhost"
@@ -65,17 +67,17 @@ try:
             # Normalize/decode MQTT payload (handle hex, JSON with base64, raw base64)
 
             payload_result = _normalize_payload(message.payload)
-            print(f"[MQTT DEBUG] find_base64_image result type: {type(payload_result)}")
+            dlogger.log(f"[MQTT DEBUG] find_base64_image result type: {type(payload_result)}", level="debug")
             if isinstance(payload_result, dict) and "image" in payload_result:
                 img_val = payload_result["image"]
                 if isinstance(img_val, list):
-                    print(f"[MQTT DEBUG] image count: {len(img_val)}; sizes: {[len(b) for b in img_val]}")
+                    dlogger.log(f"[MQTT DEBUG] image count: {len(img_val)}; sizes: {[len(b) for b in img_val]}", level="debug")
                 elif isinstance(img_val, bytes):
-                    print(f"[MQTT DEBUG] single image size: {len(img_val)}")
+                    dlogger.log(f"[MQTT DEBUG] single image size: {len(img_val)}", level="debug")
                 else:
-                    print(f"[MQTT DEBUG] image value type: {type(img_val)}")
+                    dlogger.log(f"[MQTT DEBUG] image value type: {type(img_val)}", level="debug")
             else:
-                print(f"[MQTT DEBUG] payload_result: {payload_result}")
+                dlogger.log(f"[MQTT DEBUG] payload_result: {payload_result}", level="debug")
             # 실제 이미지 바이트만 추출
             if isinstance(payload_result, dict) and "image" in payload_result:
                 if isinstance(payload_result["image"], list):
@@ -101,14 +103,14 @@ try:
             try:
                 if isinstance(payload, (bytes, bytearray)):
                     plen = len(payload)
-                    print(f"[MQTT DEBUG] extracted payload type={type(payload)}, len={plen}")
+                    dlogger.log(f"[MQTT DEBUG] extracted payload type={type(payload)}, len={plen}", level="debug")
                     if plen:
-                        print(f"[MQTT DEBUG] payload head hex: {payload[:32].hex()}")
+                        dlogger.log(f"[MQTT DEBUG] payload head hex: {payload[:32].hex()}", level="debug")
                 else:
                     s = str(payload)
-                    print(f"[MQTT DEBUG] extracted payload type={type(payload)}, repr head={s[:128]!r}")
+                    dlogger.log(f"[MQTT DEBUG] extracted payload type={type(payload)}, repr head={s[:128]!r}", level="debug")
             except Exception as _e:
-                print(f"[MQTT DEBUG] payload debug failed: {_e}")
+                dlogger.log(f"[MQTT DEBUG] payload debug failed: {_e}", level="debug")
 
             # 포맷 검증은 강제하지 않음 — 가능한 경우 메타정보를 얻고, 실패 시 기본값을 사용
             img_info = validate_image_format(payload)
@@ -125,8 +127,9 @@ try:
 
             # 유효한 이미지 처리
             filename = f"mqtt_{message.topic.replace('/', '_')}{img_info['extension']}"
-            print(
-                f"✅ MQTT 이미지 수신: {filename} ({img_info['width']}x{img_info['height']}, {img_info['size']} bytes)"
+            dlogger.log(
+                f"✅ MQTT 이미지 수신: {filename} ({img_info['width']}x{img_info['height']}, {img_info['size']} bytes)",
+                level="info",
             )
 
             # use normalized payload (may have been decoded from hex/base64/JSON)
@@ -156,7 +159,7 @@ try:
     )
 except Exception as e:
     _MQTT_CLIENT = None
-    print(f"MQTT client init failed: {e}")
+    dlogger.log(f"MQTT client init failed: {e}", level="error")
 
 
 # Start a background monitor that periodically prints MQTT connection info.
@@ -166,11 +169,12 @@ def _start_mqtt_monitor(interval: int = 10):
             try:
                 connected = is_client_connected(_MQTT_CLIENT)
                 now = datetime.now().isoformat()
-                print(
-                    f"[{now}] MQTT status: connected={connected} broker={_MQTT_BROKER}:{_MQTT_PORT} in_topic={_IN_TOPIC} out_topic={_OUT_TOPIC}"
+                dlogger.log(
+                    f"[{now}] MQTT status: connected={connected} broker={_MQTT_BROKER}:{_MQTT_PORT} in_topic={_IN_TOPIC} out_topic={_OUT_TOPIC}",
+                    level="info",
                 )
             except Exception:
-                print(f"[{datetime.now().isoformat()}] MQTT status: check failed")
+                dlogger.log(f"[{datetime.now().isoformat()}] MQTT status: check failed", level="warning")
             time.sleep(interval)
 
     t = threading.Thread(target=_monitor, daemon=True)
@@ -248,7 +252,7 @@ def validate_image_format(data: bytes) -> dict:
 
 
 # Initialize Scratch Detection Pipeline (configurable backends)
-print("🚀 Scratch Detection Pipeline 초기화 중...")
+dlogger.log("🚀 Scratch Detection Pipeline 초기화 중...", level="info")
 try:
     _SCRATCH_PIPELINE = Pipeline(
         det_backend=os.environ.get("DETECTION_BACKEND", "yolo"),
@@ -266,9 +270,9 @@ try:
             "PATCHCORE_CHECKPOINT", os.path.join("models", "patch_core")
         ),
     )
-    print("✅ Scratch Detection Pipeline 준비 완료!")
+    dlogger.log("✅ Scratch Detection Pipeline 준비 완료!", level="info")
 except Exception as e:
-    print(f"❌ Scratch Detection Pipeline 초기화 실패: {e}")
+    dlogger.log(f"❌ Scratch Detection Pipeline 초기화 실패: {e}", level="error")
     _SCRATCH_PIPELINE = None
 
 # Load configuration object
@@ -333,8 +337,9 @@ def process_image(
         }
 
     # 유효한(또는 기본값) 이미지 정보 로깅
-    print(
-        f"📸 이미지 수신: {filename} ({img_info['width']}x{img_info['height']}, format={img_info.get('format')}, size={img_info['size']} bytes)"
+    dlogger.log(
+        f"📸 이미지 수신: {filename} ({img_info['width']}x{img_info['height']}, format={img_info.get('format')}, size={img_info['size']} bytes)",
+        level="info",
     )
 
     # 실제 감지(inference) 수행
@@ -380,7 +385,7 @@ def process_image(
                     "result": "pass",
                     "reason": "no car (cls=1,2) detected",
                 }
-                print("[DEBUG] pipeline summary: no car (cls=1,2) detected, pass")
+                dlogger.log("[DEBUG] pipeline summary: no car (cls=1,2) detected, pass", level="debug")
             else:
                 scratch_count = sum(1 for r in car_regions if r.get("class_id") == 5)
                 broken_count = 0  # 필요시 클래스별로 집계
@@ -398,7 +403,7 @@ def process_image(
                     "car_regions": car_regions,
                     "result": ("defect" if scratch_count > 0 else "ok"),
                 }
-                print(f"[DEBUG] pipeline summary: scratch_count={scratch_count}")
+                dlogger.log(f"[DEBUG] pipeline summary: scratch_count={scratch_count}", level="debug")
             try:
                 os.unlink(tmp_path)
             except Exception:
@@ -434,7 +439,7 @@ def detect():
     images = []
     if request.is_json:
         req_json = request.get_json()
-        print("[DEBUG] /detect JSON payload:", json.dumps(req_json, ensure_ascii=False))
+        dlogger.log(f"[DEBUG] /detect JSON payload: {json.dumps(req_json, ensure_ascii=False)}", level="debug")
         images = req_json.get("images", [])
         # images가 없으면 에러
         if not images:

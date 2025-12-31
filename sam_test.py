@@ -2,6 +2,9 @@ import pathlib
 from pathlib import Path
 
 import cv2
+from _daily_logger import DailyLogger
+
+logger = DailyLogger()
 
 from detection.sam_detector import SAMDetector
 
@@ -10,26 +13,26 @@ detector = SAMDetector(model_path="FastSAM-s.pt", prompt="toy car", device="cuda
 
 
 def run_on_image(source: Path) -> None:
-    print(f"\n=== {source} ===")
+    logger.log(f"\n=== {source} ===", level="info")
 
     regions, annotated = detector.detect(source, return_image=True)
 
     if not regions:
-        print("No car detections.")
+        logger.log("No car detections.", level="info")
     else:
-        print(f"Detected cars: {len(regions)}")
+        logger.log(f"Detected cars: {len(regions)}", level="info")
         for i, r in enumerate(regions):
             bbox = r["bbox"]
             conf = r.get("conf", 0)
             cls = r.get("class_id", 0)
-            print(f"[{i}] bbox={bbox}, conf={conf:.3f}, class={cls}")
+            logger.log(f"[{i}] bbox={bbox}, conf={conf:.3f}, class={cls}", level="info")
 
     # Save color-preserved annotated image
     out_dir = Path("debug")
     out_dir.mkdir(exist_ok=True)
     out_path = out_dir / f"sam_{source.name}"
     cv2.imwrite(str(out_path), annotated)
-    print(f"Saved: {out_path}")
+    logger.log(f"Saved: {out_path}", level="info")
 
 
 if __name__ == "__main__":
