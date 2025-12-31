@@ -249,8 +249,27 @@ class Pipeline:
             cv2.imshow("result", image)
             cv2.waitKey(1)
 
-        # 결과를 날짜별 파일에 자동 저장
-        self.logger.save_result({"image": str(image_path), "results": results})
+        # 이미지 수준의 요약 결과 계산: anomaly 또는 defect 클래스가 있으면 'defect' 아니면 'ok'
+        defect_detected = False
+        try:
+            for r in results:
+                cls_id = r.get("class_id")
+                # 클래스 기반 결함 판단 (cls=5,6는 defect 타입으로 처리)
+                if cls_id in (5, 6):
+                    defect_detected = True
+                    break
+                # anomaly 정보가 있으면 is_anomaly로 판단
+                an = r.get("anomaly")
+                if isinstance(an, dict) and an.get("is_anomaly"):
+                    defect_detected = True
+                    break
+        except Exception:
+            defect_detected = False
+
+        image_result = "defect" if defect_detected else "ok"
+
+        # 결과를 날짜별 파일에 자동 저장 (최상위 result 포함)
+        self.logger.save_result({"image": str(image_path), "results": results, "result": image_result})
         return results
 
     def run_directory(self, source_dir: Path, save_dir: Optional[Path] = None):

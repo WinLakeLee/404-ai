@@ -28,6 +28,7 @@ import io
 import re
 import base64
 from _daily_logger import DailyLogger
+from itertools import count
 
 # Load environment variables from .env (or DOTENV_PATH) before reading any settings
 load_dotenv(dotenv_path=os.environ.get("DOTENV_PATH", ".env"), override=True)
@@ -35,6 +36,16 @@ load_dotenv(dotenv_path=os.environ.get("DOTENV_PATH", ".env"), override=True)
 app = Flask(__name__)
 _EXECUTOR = ThreadPoolExecutor(max_workers=int(os.environ.get("APP_WORKERS", 4)))
 dlogger = DailyLogger()
+
+# Create a per-process upload session directory at app start to avoid
+# filename collisions when multiple images arrive with the same timestamps.
+# Files will be saved under debug/session_<YYYYMMDD>T<HHMMSS>/ and named 1.ext, 2.ext, ...
+_UPLOAD_SESSION = datetime.now().strftime("session_%Y%m%dT%H%M%S")
+_UPLOAD_DIR = os.path.join(os.getcwd(), "debug", _UPLOAD_SESSION)
+os.makedirs(_UPLOAD_DIR, exist_ok=True)
+# thread-safe counter for filenames
+_UPLOAD_COUNTER = count(1)
+_UPLOAD_COUNTER_LOCK = threading.Lock()
 
 # MQTT settings (single broker for pub/sub)
 _MQTT_BROKER = os.environ.get("MQTT_BROKER") or "localhost"
@@ -45,6 +56,11 @@ _MQTT_KEEPALIVE = int(os.environ.get("MQTT_KEEPALIVE", 60))
 _IN_TOPIC = os.environ.get("IN_MQTT_TOPIC") or "camera01/control"
 _OUT_TOPIC = os.environ.get("MQTT_TOPIC") or "camera01/result"
 _OUT_QOS = int(os.environ.get("OUT_MQTT_QOS") or os.environ.get("MQTT_QOS") or 1)
+
+# ACK behavior: don't publish ACKs to the main result topic by default.
+# Set `MQTT_SEND_ACK=1` to enable ACKs, and `MQTT_ACK_TOPIC` to change the ack topic.
+_MQTT_SEND_ACK = (os.environ.get("MQTT_SEND_ACK") or "0").lower() in ("1", "true", "yes")
+_MQTT_ACK_TOPIC = os.environ.get("MQTT_ACK_TOPIC") or None
 
 app.config["MQTT_BROKER_URL"] = _MQTT_BROKER
 app.config["MQTT_BROKER_PORT"] = _MQTT_PORT
@@ -78,73 +94,98 @@ try:
                     dlogger.log(f"[MQTT DEBUG] image value type: {type(img_val)}", level="debug")
             else:
                 dlogger.log(f"[MQTT DEBUG] payload_result: {payload_result}", level="debug")
-            # 실제 이미지 바이트만 추출
+            # 실제 이미지 바이트들만 추출 (단일 또는 리스트)
+            images = []
             if isinstance(payload_result, dict) and "image" in payload_result:
-                if isinstance(payload_result["image"], list):
-                    payload = payload_result["image"][0] if payload_result["image"] else b""
+                img_val = payload_result["image"]
+                if isinstance(img_val, list):
+                    images = img_val
                 else:
-                    payload = payload_result["image"]
+                    images = [img_val]
             else:
-                payload = payload_result
+                images = [payload_result]
 
-            # Optional ACK/heartbeat to indicate message received
+            # Optional ACK/heartbeat to indicate message received. Send once per incoming message.
             try:
-                # ACK: identify broker (use full broker string, not first char)
-                publish_with_client(
-                    _MQTT_CLIENT,
-                    {"id": _MQTT_BROKER, "timestamp": datetime.now().isoformat()},
-                    topic=_OUT_TOPIC,
-                    qos=_OUT_QOS,
-                )
-            except Exception:
-                publish_mqtt(payload={"error": ConnectionRefusedError()})
-
-            # 추가 디버그: 추출된 payload 정보(타입/크기/헤드)를 로그에 남겨 문제 원인 파악에 도움
-            try:
-                if isinstance(payload, (bytes, bytearray)):
-                    plen = len(payload)
-                    dlogger.log(f"[MQTT DEBUG] extracted payload type={type(payload)}, len={plen}", level="debug")
-                    if plen:
-                        dlogger.log(f"[MQTT DEBUG] payload head hex: {payload[:32].hex()}", level="debug")
-                else:
-                    s = str(payload)
-                    dlogger.log(f"[MQTT DEBUG] extracted payload type={type(payload)}, repr head={s[:128]!r}", level="debug")
-            except Exception as _e:
-                dlogger.log(f"[MQTT DEBUG] payload debug failed: {_e}", level="debug")
-
-            # 포맷 검증은 강제하지 않음 — 가능한 경우 메타정보를 얻고, 실패 시 기본값을 사용
-            img_info = validate_image_format(payload)
-            if not img_info.get("valid"):
-                img_info = {
-                    "valid": True,
-                    "format": "jpg",
-                    "extension": ".jpg",
-                    "mime_type": "image/jpeg",
-                    "size": len(payload),
-                    "width": 0,
-                    "height": 0,
-                }
-
-            # 유효한 이미지 처리
-            filename = f"mqtt_{message.topic.replace('/', '_')}{img_info['extension']}"
-            dlogger.log(
-                f"✅ MQTT 이미지 수신: {filename} ({img_info['width']}x{img_info['height']}, {img_info['size']} bytes)",
-                level="info",
-            )
-
-            # use normalized payload (may have been decoded from hex/base64/JSON)
-            resp = process_image(payload, filename, img_info["mime_type"])
-            # result가 'pass'가 아니면 publish
-            if resp.get("detection", {}).get("result") != "pass":
-                try:
+                if _MQTT_SEND_ACK:
+                    ack_topic = _MQTT_ACK_TOPIC or f"{_OUT_TOPIC}_ack"
                     publish_with_client(
-                        _MQTT_CLIENT, resp, topic=_OUT_TOPIC, qos=_OUT_QOS
+                        _MQTT_CLIENT,
+                        {"id": _MQTT_BROKER, "timestamp": datetime.now().isoformat()},
+                        topic=ack_topic,
+                        qos=_OUT_QOS,
                     )
-                except Exception:
-                    # fallback to ephemeral publish if persistent client fails
-                    publish_mqtt(resp)
+            except Exception:
+                if _MQTT_SEND_ACK:
+                    try:
+                        publish_mqtt(payload={"error": ConnectionRefusedError()})
+                    except Exception:
+                        pass
+
+            # 각 이미지를 순회하여 처리
+            responses = []
+            non_pass_responses = []
+            for idx, payload in enumerate(images, start=1):
+                # 추가 디버그: 추출된 payload 정보(타입/크기/헤드)를 로그에 남김
+                try:
+                    if isinstance(payload, (bytes, bytearray)):
+                        plen = len(payload)
+                        dlogger.log(f"[MQTT DEBUG] extracted payload type={type(payload)}, len={plen}", level="debug")
+                        if plen:
+                            dlogger.log(f"[MQTT DEBUG] payload head hex: {payload[:32].hex()}", level="debug")
+                    else:
+                        s = str(payload)
+                        dlogger.log(f"[MQTT DEBUG] extracted payload type={type(payload)}, repr head={s[:128]!r}", level="debug")
+                except Exception as _e:
+                    dlogger.log(f"[MQTT DEBUG] payload debug failed: {_e}", level="debug")
+
+                # 포맷 검증
+                img_info = validate_image_format(payload)
+                if not img_info.get("valid"):
+                    img_info = {
+                        "valid": True,
+                        "format": "jpg",
+                        "extension": ".jpg",
+                        "mime_type": "image/jpeg",
+                        "size": len(payload),
+                        "width": 0,
+                        "height": 0,
+                    }
+
+                # 유효한 이미지 처리 (파일명에 인덱스 추가)
+                base_name = f"mqtt_{message.topic.replace('/', '_')}"
+                if len(images) > 1:
+                    filename = f"{base_name}_{idx}{img_info['extension']}"
+                else:
+                    filename = f"{base_name}{img_info['extension']}"
+                dlogger.log(
+                    f"✅ MQTT 이미지 수신: {filename} ({img_info['width']}x{img_info['height']}, {img_info['size']} bytes)",
+                    level="info",
+                )
+
+                # use normalized payload (may have been decoded from hex/base64/JSON)
+                resp = process_image(payload, filename, img_info["mime_type"])
+                responses.append(resp)
+                if resp.get("detection", {}).get("result") != "pass":
+                    non_pass_responses.append(resp)
+                else:
+                    dlogger.log(f"Image {idx} detection result == 'pass' (no car); will skip publishing for this image unless another image requires publish)", level="debug")
+
+            # After processing all images in this MQTT message, publish only if
+            # at least one image has result != 'pass'. If so, publish all non-pass responses.
+            if len(non_pass_responses) == 0:
+                dlogger.log("MQTT publish skipped: all images result == 'pass' (no car)", level="info")
             else:
-                publish_mqtt(resp)
+                # If the incoming payload contained multiple images, publish a
+                # single batched message with a result list aligned to the input
+                # order (`responses`). If the input was a single image, publish
+                # the single response dict as before.
+                # Use shared aggregation helper to build the top-level response
+                aggregated = aggregate_batch_response(responses)
+                try:
+                    publish_with_client(_MQTT_CLIENT, aggregated, topic=_OUT_TOPIC, qos=_OUT_QOS)
+                except Exception:
+                    publish_mqtt(aggregated)
 
         _EXECUTOR.submit(_task)
 
@@ -228,10 +269,46 @@ def validate_image_format(data: bytes) -> dict:
 
     fmt, ext, mime = detected_format
 
-    # PIL로 이미지 검증 및 크기 확인
+    # 이미지 안전성 검사: PIL 검증, 치수/픽셀수 제한, 의심 서명 스캔
     try:
+        # 환경 변수로 제한값을 조정 가능
+        try:
+            max_pixels = int(os.environ.get("IMAGE_MAX_PIXELS", "30000000"))
+        except Exception:
+            max_pixels = 30000000
+        Image.MAX_IMAGE_PIXELS = max_pixels
+
+        # 먼저 빠르게 검증(verify)하여 손상 여부 확인
+        img = Image.open(io.BytesIO(data))
+        img.verify()
+
+        # 실제 크기를 얻기 위해 다시 열기
         img = Image.open(io.BytesIO(data))
         width, height = img.size
+
+        try:
+            max_w = int(os.environ.get("IMAGE_MAX_WIDTH", "10000"))
+            max_h = int(os.environ.get("IMAGE_MAX_HEIGHT", "10000"))
+            min_w = int(os.environ.get("IMAGE_MIN_WIDTH", "1"))
+            min_h = int(os.environ.get("IMAGE_MIN_HEIGHT", "1"))
+        except Exception:
+            max_w, max_h, min_w, min_h = 10000, 10000, 1, 1
+
+        if width <= 0 or height <= 0:
+            return {"valid": False, "size": len(data), "error": "이미지 치수가 유효하지 않습니다"}
+
+        if width < min_w or height < min_h:
+            return {"valid": False, "size": len(data), "error": f"이미지 치수가 너무 작습니다 ({width}x{height})"}
+
+        if width > max_w or height > max_h:
+            return {"valid": False, "size": len(data), "error": f"이미지 치수가 너무 큽니다 ({width}x{height})"}
+
+        # 간단한 서명 스캔: 헤더/앞부분에서 스크립트/실행 파일/압축 아카이브 흔적 검출
+        head = data[:4096].lower()
+        suspicious_signatures = [b"<?php", b"<script", b"javascript:", b"pk\x03\x04", b"mz", b"#!/bin/sh", b"<!doctype html"]
+        for sig in suspicious_signatures:
+            if sig in head:
+                return {"valid": False, "size": len(data), "error": f"의심 서명 발견: {sig.decode('latin1', 'ignore')}"}
 
         return {
             "valid": True,
@@ -242,13 +319,60 @@ def validate_image_format(data: bytes) -> dict:
             "width": width,
             "height": height,
         }
+    except Image.DecompressionBombError as e:
+        return {"valid": False, "size": len(data), "error": f"이미지 디컴프레스 폭탄 의심: {str(e)}"}
     except Exception as e:
-        return {
-            "valid": False,
-            "size": len(data),
-            "format": fmt,
-            "error": f"이미지 검증 실패: {str(e)}",
-        }
+        return {"valid": False, "size": len(data), "format": fmt, "error": f"이미지 검증 실패: {str(e)}"}
+
+
+def aggregate_batch_response(responses: list) -> dict:
+    """
+    Given a list of per-image response dicts (as returned by `process_image`),
+    compute the aggregated top-level response structure used by HTTP `/detect`
+    and MQTT publications.
+
+    Returns a dict with keys: result, scratch_count, broken_count,
+    separated_count, result_image (list), car_regions (list), reason, timestamp
+    """
+    total_scratch_count = 0
+    total_broken_count = 0
+    total_separated_count = 0
+    total_car_regions = []
+    result_images = []
+    detected_any = False
+    reasons = []
+
+    for resp in responses:
+        det = resp.get("detection", {})
+        total_scratch_count += det.get("scratch_count", 0)
+        total_broken_count += det.get("broken_count", 0)
+        total_separated_count += det.get("separated_count", 0)
+        total_car_regions.extend(det.get("car_regions", []))
+        rimg = det.get("result_image")
+        if rimg:
+            if not isinstance(rimg, str):
+                rimg = str(rimg)
+            if not rimg.startswith("data:image/jpeg;base64,"):
+                rimg = f"data:image/jpeg;base64,{rimg.lstrip()}"
+            result_images.append(rimg)
+        else:
+            result_images.append("")
+        if det.get("result") != "pass":
+            detected_any = True
+        if "reason" in det:
+            reasons.append(det.get("reason"))
+
+    aggregated = {
+        "result": "defect" if detected_any else "ok",
+        "scratch_count": total_scratch_count,
+        "broken_count": total_broken_count,
+        "separated_count": total_separated_count,
+        "result_image": result_images,
+        "car_regions": total_car_regions,
+        "reason": "; ".join(reasons) if reasons else None,
+        "timestamp": datetime.now().isoformat(),
+    }
+    return aggregated
 
 
 # Initialize Scratch Detection Pipeline (configurable backends)
@@ -351,13 +475,13 @@ def process_image(
             ) as tmp:
                 tmp.write(data)
                 tmp_path = tmp.name
-            # 결과 이미지 저장 경로 (디버그용)
-            debug_dir = os.path.join(os.getcwd(), "debug")
-            os.makedirs(debug_dir, exist_ok=True)
-            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            # 파일명에 원본 이미지 이름(확장자 제거) 추가하여 중복 방지
+            # 결과 이미지 저장 경로 (디버그용) — use per-process upload session dir
+            debug_dir = _UPLOAD_DIR
+            # 파일명은 세션 내에서 1,2,3... 형식으로 충돌 회피
+            with _UPLOAD_COUNTER_LOCK:
+                idx = next(_UPLOAD_COUNTER)
             base_name = os.path.splitext(filename)[0]
-            debug_img_path = os.path.join(debug_dir, f"scratch_result_{ts}_{base_name}.jpg")
+            debug_img_path = os.path.join(debug_dir, f"{idx:04d}_{base_name}{img_info['extension']}")
             # 감지 수행
             from pathlib import Path
 
@@ -413,15 +537,23 @@ def process_image(
     else:
         scratch_result = {"skipped": True, "reason": "scratch_pipeline_not_configured"}
 
+    # Derive top-level result: prefer the pipeline's per-image `result` when present.
+    # Map internal 'pass' -> top-level 'ok'. Fallback to 'defect' if any defect flags present.
     overall_result = "ok"
     try:
-        if isinstance(scratch_result, dict) and (
-            scratch_result.get("scratch_detected")
-            or scratch_result.get("broken_detected")
-            or scratch_result.get("separated_detected")
-            or scratch_result.get("anomaly_detected")
-        ):
-            overall_result = "detected"
+        if isinstance(scratch_result, dict):
+            det_res = scratch_result.get("result")
+            if det_res:
+                # Preserve pipeline's explicit result values ('pass', 'ok', 'defect')
+                overall_result = det_res
+            else:
+                if (
+                    scratch_result.get("scratch_detected")
+                    or scratch_result.get("broken_detected")
+                    or scratch_result.get("separated_detected")
+                    or scratch_result.get("anomaly_detected")
+                ):
+                    overall_result = "defect"
     except Exception:
         overall_result = "ok"
 
@@ -468,14 +600,16 @@ def detect():
     total_car_regions = []
     detected_any = False
     reasons = []
+
+    # Collect per-image responses for batching behavior
+    responses = []
+    non_pass_responses = []
     for data, fname in image_datas:
         if not data:
             continue
-        resp = process_image(
-            data,
-            filename=fname,
-            mimetype=None,
-        )
+        resp = process_image(data, filename=fname, mimetype=None)
+        responses.append(resp)
+
         det = resp.get("detection", {})
         car_regions = det.get("car_regions", [])
         # car_regions가 없으면 이 이미지는 완전히 무시
@@ -496,31 +630,40 @@ def detect():
         total_car_regions.extend(car_regions)
         if det.get("result") != "pass":
             detected_any = True
+            non_pass_responses.append(resp)
         if "reason" in det:
             reasons.append(det["reason"])
-        # result가 'pass'가 아니면 publish
-        if det.get("result") != "pass":
-            if _MQTT_CLIENT is not None:
-                try:
-                    publish_with_client(
-                        _MQTT_CLIENT, resp, topic=_OUT_TOPIC, qos=_OUT_QOS
-                    )
-                except Exception:
-                    publish_mqtt(resp)
+
+    # MQTT publish: if input was a list, publish batched list (aligned to input order)
+    # only when NOT all images are 'pass'. For single-image input, publish single
+    # response object unless it is 'pass'.
+    if len(non_pass_responses) == 0:
+        dlogger.log("HTTP /detect: publish skipped — all images result == 'pass'", level="info")
+    else:
+        try:
+            if len(image_datas) > 1:
+                batched = {
+                    "id": str(uuid.uuid4()),
+                    "timestamp": datetime.now().isoformat(),
+                    "source": "http:/detect",
+                    "images": responses,
+                }
             else:
-                publish_mqtt(resp)
-    # 최종 응답 dict 구성
-    response = {
-        "result": "defect" if detected_any else "ok",
-        "scratch_count": total_scratch_count,
-        "broken_count": total_broken_count,
-        "separated_count": total_separated_count,
-        "result_image": result_images,
-        "car_regions": total_car_regions,
-        "reason": "; ".join(reasons) if reasons else None,
-        "timestamp": datetime.now().isoformat(),
-    }
-    return jsonify(response)
+                # single-image input: publish single non-pass response
+                batched = non_pass_responses[0]
+
+            if _MQTT_CLIENT is not None:
+                publish_with_client(_MQTT_CLIENT, batched, topic=_OUT_TOPIC, qos=_OUT_QOS)
+            else:
+                publish_mqtt(batched)
+        except Exception:
+            try:
+                publish_mqtt(batched)
+            except Exception:
+                dlogger.log("Failed to publish HTTP-detect batched result", level="error")
+    # 최종 응답 dict 구성 (공통 함수 사용)
+    aggregated = aggregate_batch_response(responses)
+    return jsonify(aggregated)
 
 
 if __name__ == "__main__":
