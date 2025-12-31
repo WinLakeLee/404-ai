@@ -7,6 +7,7 @@ import os
 import json
 import requests
 import sys
+import shutil
 from concurrent.futures import ThreadPoolExecutor
 import uuid
 from flask import Flask, jsonify, request
@@ -37,6 +38,9 @@ load_dotenv(dotenv_path=os.environ.get("DOTENV_PATH", ".env"), override=True)
 app = Flask(__name__)
 _EXECUTOR = ThreadPoolExecutor(max_workers=int(os.environ.get("APP_WORKERS", 4)))
 dlogger = DailyLogger()
+
+# Process start time for uptime reporting
+_START_TIME = datetime.now()
 
 # Create a per-process upload session directory at app start to avoid
 # filename collisions when multiple images arrive with the same timestamps.
@@ -349,29 +353,66 @@ def index():
 @app.route("/health")
 def health():
     deps = {}
+    for pkg, name in (("flask", "flask"), ("cv2", "opencv"), ("ultralytics", "ultralytics")):
+        try:
+            __import__(pkg)
+            deps[name] = "installed"
+        except Exception:
+            deps[name] = "not installed"
+
+    # basic system info
+    uptime_sec = int((datetime.now() - _START_TIME).total_seconds())
+    disk = shutil.disk_usage(os.getcwd())
+
+    # MQTT status
+    mqtt_connected = False
     try:
-        import flask  # noqa: F401
+        mqtt_connected = bool(is_client_connected(_MQTT_CLIENT))
+    except Exception:
+        mqtt_connected = False
 
-        deps["flask"] = "installed"
-    except ImportError:
-        deps["flask"] = "not installed"
-    try:
-        import cv2  # noqa: F401
+    # Pipeline / detector / anomaly readiness
+    pipeline_ok = _SCRATCH_PIPELINE is not None
+    detector_info = {}
+    anomaly_info = {}
+    if pipeline_ok:
+        det = getattr(_SCRATCH_PIPELINE, "detector", None)
+        if det is not None:
+            detector_info["class"] = det.__class__.__name__
+            detector_info["model_path"] = getattr(det, "model_path", None)
+            detector_info["model_exists"] = bool(detector_info.get("model_path") and os.path.exists(str(detector_info.get("model_path"))))
+            detector_info["conf"] = getattr(det, "conf", None)
 
-        deps["opencv"] = "installed"
-    except ImportError:
-        deps["opencv"] = "not installed"
-    try:
-        import ultralytics  # noqa: F401
+        an = getattr(_SCRATCH_PIPELINE, "anomaly", None)
+        if an is not None:
+            anomaly_info["class"] = an.__class__.__name__
+            # best-effort detection of readiness
+            anomaly_info["ready"] = True
+        else:
+            anomaly_info["ready"] = False
 
-        deps["ultralytics"] = "installed"
-    except ImportError:
-        deps["ultralytics"] = "not installed"
+    status_overall = "healthy" if (all(v == "installed" for v in deps.values()) and pipeline_ok and mqtt_connected) else "degraded"
 
-    all_ok = all(v == "installed" for v in deps.values())
-    return jsonify(
-        {"status": "healthy" if all_ok else "degraded", "dependencies": deps}
-    )
+    payload = {
+        "status": status_overall,
+        "timestamp": datetime.now().isoformat(),
+        "uptime_sec": uptime_sec,
+        "disk_free_bytes": disk.free,
+        "dependencies": deps,
+        "mqtt": {"connected": mqtt_connected, "broker": _MQTT_BROKER, "port": _MQTT_PORT},
+        "pipeline": {
+            "initialized": pipeline_ok,
+            "detector": detector_info,
+            "anomaly": anomaly_info,
+        },
+        "env": {
+            "detection_backend": os.environ.get("DETECTION_BACKEND"),
+            "anomaly_backend": os.environ.get("ANOMALY_BACKEND"),
+            "sam_model": os.environ.get("SAM_MODEL_PATH"),
+        },
+    }
+
+    return jsonify(payload)
 
 
 def process_image(
