@@ -8,7 +8,8 @@ $pythonVersion = & python --version 2>&1
 if ($LASTEXITCODE -ne 0) {
     Write-Host "Python not found. Ensure 'python' is on PATH." -ForegroundColor Red
     exit 1
-} else {
+}
+else {
     Write-Host $pythonVersion -ForegroundColor Green
 }
 
@@ -22,14 +23,15 @@ function Run-PyCheck {
     $rc = $LASTEXITCODE
     if ($rc -eq 0) {
         Write-Host $out -ForegroundColor Green
-    } else {
+    }
+    else {
         Write-Host $out -ForegroundColor Yellow
     }
     return $rc
 }
 
 $checks = @(
-@{ label = "PyTorch (CUDA)"; code = @'
+    @{ label = "PyTorch (CUDA)"; code = @'
 import sys
 try:
     import torch
@@ -37,9 +39,10 @@ try:
 except ImportError:
     print("PyTorch is not installed. Please install it to check CUDA availability.")
     sys.exit(1)
-'@ },
+'@ 
+    },
 
-@{ label = "Ultralytics"; code = @'
+    @{ label = "Ultralytics"; code = @'
 import sys
 try:
     import ultralytics
@@ -47,9 +50,10 @@ try:
 except ImportError:
     print("Ultralytics is not installed. Please install it to use FastSAM.")
     sys.exit(1)
-'@ },
+'@ 
+    },
 
-@{ label = "Paho-MQTT"; code = @'
+    @{ label = "Paho-MQTT"; code = @'
 import sys
 try:
     import paho.mqtt.client as mqtt
@@ -57,9 +61,10 @@ try:
 except ImportError:
     print("Paho-MQTT is not installed. Please install it to use MQTT features.")
     sys.exit(1)
-'@ },
+'@ 
+    },
 
-@{ label = "PIL (Pillow)"; code = @'
+    @{ label = "PIL (Pillow)"; code = @'
 import sys
 try:
     import PIL
@@ -67,9 +72,10 @@ try:
 except ImportError:
     print("PIL (Pillow) is not installed. Please install it to handle image processing.")
     sys.exit(1)
-'@ },
+'@ 
+    },
 
-@{ label = "OpenCV (cv2)"; code = @'
+    @{ label = "OpenCV (cv2)"; code = @'
 import sys
 try:
     import cv2
@@ -77,9 +83,10 @@ try:
 except ImportError:
     print("OpenCV is not installed. Please install it to handle image and video processing.")
     sys.exit(1)
-'@ },
+'@ 
+    },
 
-@{ label = "NumPy"; code = @'
+    @{ label = "NumPy"; code = @'
 import sys
 try:
     import numpy as np
@@ -87,9 +94,10 @@ try:
 except ImportError:
     print("NumPy is not installed. Please install it for numerical operations.")
     sys.exit(1)
-'@ },
+'@ 
+    },
 
-@{ label = "Matplotlib"; code = @'
+    @{ label = "Matplotlib"; code = @'
 import sys
 try:
     import matplotlib
@@ -97,9 +105,10 @@ try:
 except ImportError:
     print("Matplotlib is not installed. Please install it for plotting and visualization.")
     sys.exit(1)
-'@ },
+'@ 
+    },
 
-@{ label = "python-dotenv"; code = @'
+    @{ label = "python-dotenv"; code = @'
 import sys
 try:
     import dotenv
@@ -108,18 +117,19 @@ try:
 except ImportError:
     print("python-dotenv is not installed. Please install it to manage environment variables.")
     sys.exit(1)
-'@ }
+'@ 
+    }
 )
 
 # 패키지 -> 설치 커맨드 매핑 (PyTorch는 별도 로직으로 처리)
 $installMap = @{
-    'Ultralytics' = @{ args = 'install ultralytics==8.3.240' }
-    'Scikit-Learn' = @{ args = 'install scikit-learn==1.3.2' }
-    'Paho-MQTT' = @{ args = 'install paho-mqtt==1.6.1' }
-    'PIL (Pillow)' = @{ args = 'install pillow==10.1.0' }
-    'OpenCV (cv2)' = @{ args = 'install opencv-python==4.12.0.88' }
-    'NumPy' = @{ args = 'install numpy==2.2.6' }
-    'Matplotlib' = @{ args = 'install matplotlib==3.10.8' }
+    'Ultralytics'   = @{ args = 'install ultralytics==8.3.240' }
+    'Scikit-Learn'  = @{ args = 'install scikit-learn==1.3.2' }
+    'Paho-MQTT'     = @{ args = 'install paho-mqtt==1.6.1' }
+    'PIL (Pillow)'  = @{ args = 'install pillow==10.1.0' }
+    'OpenCV (cv2)'  = @{ args = 'install opencv-python==4.12.0.88' }
+    'NumPy'         = @{ args = 'install numpy==2.2.6' }
+    'Matplotlib'    = @{ args = 'install matplotlib==3.10.8' }
     'python-dotenv' = @{ args = 'install python-dotenv==1.0.0' }
 }
 
@@ -134,7 +144,8 @@ function Install-Package {
     $rc = $LASTEXITCODE
     if ($rc -eq 0) {
         Write-Host $out -ForegroundColor Green
-    } else {
+    }
+    else {
         Write-Host $out -ForegroundColor Red
     }
     return $rc
@@ -168,8 +179,8 @@ foreach ($c in $checks) {
             $detected = Detect-GpuCudaVersion
             if ($null -ne $detected) {
                 Write-Host "Detected system CUDA version: $detected -- attempting CUDA-enabled torch install" -ForegroundColor Cyan
-                $tag = ($detected -replace '\.','')
-                if ($tag.Length -gt 3) { $tag = $tag.Substring(0,3) }
+                $tag = ($detected -replace '\.', '')
+                if ($tag.Length -gt 3) { $tag = $tag.Substring(0, 3) }
                 $torchArgs = "install torch torchvision --index-url https://download.pytorch.org/whl/cu$tag"
                 $ir = Install-Package -label "PyTorch (CUDA)" -installArgs $torchArgs
                 if ($ir -eq 0) {
@@ -178,21 +189,24 @@ foreach ($c in $checks) {
                     $rc2 = $LASTEXITCODE
                     $col2 = if ($rc2 -eq 0) { 'Green' } else { 'Yellow' }
                     Write-Host $out2 -ForegroundColor $col2
-                } else {
+                }
+                else {
                     Write-Host "Failed to install PyTorch with CUDA tag cu$tag." -ForegroundColor Red
                 }
-            } else {
+            }
+            else {
                 Write-Host "No CUDA detected (or nvidia-smi not available). Skipping automatic PyTorch installation." -ForegroundColor Yellow
             }
-        } else {
+        }
+        else {
             # torch는 설치되어 있으나 CUDA 불가인 경우 시스템 CUDA 확인 후 CUDA wheel 설치 시도
             if ($pyOut -match 'CUDA available:\s*False') {
                 Write-Host "Torch installed but CUDA not available. Detecting system CUDA..." -ForegroundColor Yellow
                 $detected = Detect-GpuCudaVersion
                 if ($null -ne $detected) {
                     Write-Host "Detected system CUDA version: $detected" -ForegroundColor Cyan
-                    $tag = ($detected -replace '\.','')
-                    if ($tag.Length -gt 3) { $tag = $tag.Substring(0,3) }
+                    $tag = ($detected -replace '\.', '')
+                    if ($tag.Length -gt 3) { $tag = $tag.Substring(0, 3) }
                     $torchArgs = "install torch torchvision --index-url https://download.pytorch.org/whl/cu$tag"
                     Write-Host "Attempting to install PyTorch with CUDA tag cu$tag..." -ForegroundColor Cyan
                     $ir = Install-Package -label "PyTorch (CUDA)" -installArgs $torchArgs
@@ -203,16 +217,19 @@ foreach ($c in $checks) {
                         $col3 = if ($rc3 -eq 0) { 'Green' } else { 'Yellow' }
                         Write-Host $out3 -ForegroundColor $col3
                         if ($out3 -match 'CUDA available:\s*True') { Write-Host "CUDA is now available for PyTorch." -ForegroundColor Green }
-                    } else {
+                    }
+                    else {
                         Write-Host "Failed to install PyTorch with CUDA tag cu$tag." -ForegroundColor Red
                     }
-                } else {
+                }
+                else {
                     Write-Host "Could not detect system CUDA via nvidia-smi. Skipping automatic CUDA install." -ForegroundColor Yellow
                 }
             }
         }
 
-    } else {
+    }
+    else {
         # 일반 패키지 처리 (없으면 설치)
         $rc = Run-PyCheck -code $c.code -label $c.label
         if ($rc -ne 0) {
@@ -223,10 +240,12 @@ foreach ($c in $checks) {
                     Write-Host "Re-checking $($c.label) after install..." -ForegroundColor Cyan
                     $rc2 = Run-PyCheck -code $c.code -label $c.label
                     if ($rc2 -ne 0) { Write-Host "$($c.label) still failing after install." -ForegroundColor Yellow }
-                } else {
+                }
+                else {
                     Write-Host "Failed to install $($c.label). See pip output above." -ForegroundColor Red
                 }
-            } else {
+            }
+            else {
                 Write-Host "No install mapping for $($c.label). Please install manually." -ForegroundColor Yellow
             }
         }

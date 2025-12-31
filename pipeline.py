@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import List, Dict, Optional
 
 import cv2
+import numpy as np
 from _daily_logger import DailyLogger
 
 from detection.yolo_detector import YOLODetector
@@ -33,7 +34,7 @@ class DetectionFactory:
         backend = backend.lower()
         if backend == "sam":
             return SAMDetector(
-                model_path=sam_model or "FastSAM-s.pt",
+                model_path=sam_model or "models/sam/FastSAM-s.pt",
                 prompt=sam_prompt or "car",
                 device=device,
                 conf=conf,
@@ -121,6 +122,23 @@ class Pipeline:
         )
         self.anomaly_threshold = anomaly_threshold
         self.logger = DailyLogger(log_dir="logs", log_prefix="pipeline")
+        # toy_car 선택 시 클래스 3/6에 대해 최소 박스 면적 비율 요구 (env TOY_CAR_MIN_AREA_RATIO)
+        self.toycar_min_area_ratio = float(os.getenv("TOY_CAR_MIN_AREA_RATIO", 0.0))
+        # 클래스별 신뢰도 매핑: env `DETECTION_CONF_MAP` 을 파싱합니다. 형식 예: "1:0.4,2:0.6,4:0.3"
+        conf_map_raw = os.getenv("DETECTION_CONF_MAP", "")
+        self.class_conf_map = {}
+        if conf_map_raw:
+            try:
+                for item in conf_map_raw.split(","):
+                    if not item.strip():
+                        continue
+                    k, v = item.split(":", 1)
+                    self.class_conf_map[int(k.strip())] = float(v.strip())
+                self.logger.log(f"Loaded class_conf_map={self.class_conf_map}")
+            except Exception as e:
+                self.logger.log(f"Failed to parse DETECTION_CONF_MAP='{conf_map_raw}': {e}", level="error")
+        # NMS IoU 임계값 (클래스 무관). 0이면 NMS 비활성화
+        self.nms_iou = float(os.getenv("DETECTION_NMS_IOU", 0.5))
 
     def run_image(self, image_path: Path, save_path: Optional[Path] = None):
         self.logger.log(f"[Input] {image_path}")
@@ -130,24 +148,68 @@ class Pipeline:
             raise ValueError(f"이미지를 로드할 수 없습니다: {image_path}")
 
         # 1. YOLO 탐색
-        regions = self.detector.detect(image_path)
-        self.logger.log(f"Detected regions: {len(regions)}")
+        # If per-class thresholds exist and are lower than detector's configured conf,
+        # request the detector to run with the lower threshold so pipeline filtering can take effect.
+        conf_override = None
+        if self.class_conf_map:
+            try:
+                min_thr = min(self.class_conf_map.values())
+                det_conf = getattr(self.detector, "conf", None)
+                if det_conf is not None and min_thr < float(det_conf):
+                    conf_override = float(min_thr)
+            except Exception:
+                conf_override = None
+        regions = self.detector.detect(image_path, conf_override=conf_override)
+        self.logger.log(f"Detected regions (pre-filter): {len(regions)}")
+        # 클래스별 임계값이 설정되어 있으면 필터링 적용
+        if self.class_conf_map:
+            filtered = []
+            for r in regions:
+                cls = r.get("class_id")
+                conf = float(r.get("conf") or 0.0)
+                thr = self.class_conf_map.get(cls)
+                if thr is None:
+                    filtered.append(r)
+                else:
+                    if conf >= thr:
+                        filtered.append(r)
+                    else:
+                        self.logger.log(f"Filtered out cls={cls} conf={conf:.3f} < thr={thr}")
+            regions = filtered
+        self.logger.log(f"Detected regions (post-filter): {len(regions)}")
 
-        # 2. 차량 존재 여부 판단 우선순위:
-        # 1 (toy_car) 우선, 그 다음 4 (toycar_housing), 그 다음 3, 그 다음 6.
-        present_cls = {reg.get("class_id") for reg in regions if reg.get("class_id") is not None}
-        if 1 in present_cls:
-            toy_car_class = 1
-        elif 4 in present_cls:
-            toy_car_class = 4
-        elif 3 in present_cls:
-            toy_car_class = 3
-        elif 6 in present_cls:
-            toy_car_class = 6
-        else:
-            toy_car_class = None
+        # Apply class-agnostic NMS to prevent overlapping boxes
+        if regions and self.nms_iou and float(self.nms_iou) > 0.0:
+            boxes = [r.get("bbox") for r in regions]
+            scores = [float(r.get("conf") or 0.0) for r in regions]
+            idxs = sorted(range(len(boxes)), key=lambda i: scores[i], reverse=True)
+            keep = []
+            while idxs:
+                cur = idxs.pop(0)
+                keep.append(cur)
+                rem = []
+                for i in idxs:
+                    # compute IoU
+                    xA = max(boxes[cur][0], boxes[i][0])
+                    yA = max(boxes[cur][1], boxes[i][1])
+                    xB = min(boxes[cur][2], boxes[i][2])
+                    yB = min(boxes[cur][3], boxes[i][3])
+                    interW = max(0, xB - xA)
+                    interH = max(0, yB - yA)
+                    interArea = interW * interH
+                    areaA = max(0, boxes[cur][2] - boxes[cur][0]) * max(0, boxes[cur][3] - boxes[cur][1])
+                    areaB = max(0, boxes[i][2] - boxes[i][0]) * max(0, boxes[i][3] - boxes[i][1])
+                    denom = float(areaA + areaB - interArea)
+                    iou_val = interArea / denom if denom > 0 else 0.0
+                    if iou_val <= float(self.nms_iou):
+                        rem.append(i)
+                idxs = rem
+            regions = [regions[i] for i in keep]
+            self.logger.log(f"Detected regions (after NMS): {len(regions)}")
+
+        # 2. 차량 존재 여부 판단: select_toy_car_class에 위임
+        toy_car_class, present_cls = self.select_toy_car_class(regions, image_shape=image.shape[:2])
         toy_car_exists = toy_car_class is not None
-        self.logger.log(f"[STEP] present_cls={present_cls} -> toy_car_class={toy_car_class}")
         # SHOW_IGNORED_CLASSES 환경변수가 true이면 cls 3,4를 임시로 legend와 bbox에 표시
         show_ignored = os.getenv("SHOW_IGNORED_CLASSES", "true").lower() in ("1", "true", "yes")
 
@@ -160,8 +222,8 @@ class Pipeline:
             5: (255, 255, 0),  # cyan
             6: (128, 128, 128),  # gray
         }
-        # 클래스 이름 매핑: 1->toy_car, 4->toycar_housing, 3->car_floor, 5->scratch, 6->separated
-        class_names = {1: "toy_car", 4: "toycar_housing", 3: "car_floor", 5: "scratch", 6: "separated"}
+        # 클래스 이름 매핑: 1->toy_car, 4->case, 3->car_floor, 2->broken, 5->scratch, 6->separated
+        class_names = {1: "toy_car", 4: "case", 3: "car_floor", 2: "broken", 5: "scratch", 6: "separated"}
 
         # pipeline은 이제 감지 결과(클래스, bbox, conf)만 반환합니다.
         # 애플리케이션 레이어에서 이미지 수준 판정이나 anomaly 실행을 담당합니다.
@@ -179,10 +241,13 @@ class Pipeline:
 
             # bbox 그리기 규칙:
             # - 항상 cls 5,6(scratch/separated)는 그림
-            # - cls 1(toy_car)와 cls 4(toycar_housing)는 표시
+            # - cls 1(toy_car)와 cls 4(case)는 표시 (단, toy_car가 감지된 경우 floor/case는 무시)
             # - cls 3(car_floor)는 cls 4가 없을 때만 표시
             # - cls 2는 기본적으로 무시(표시하려면 SHOW_IGNORED_CLASSES)
             draw_cls3 = (cls_id == 3 and 4 not in {r.get("class_id") for r in regions})
+            # if toy_car exists, ignore floor(3) and case(4) for drawing
+            if toy_car_exists and cls_id in (3, 4):
+                continue
             if (
                 cls_id in (5, 6)
                 or cls_id in (1, 4)
@@ -271,21 +336,58 @@ class Pipeline:
         self.logger.save_result({"image": str(image_path), "results": results})
         return results
 
-    def select_toy_car_class(self, regions: List[Dict]):
+    def select_toy_car_class(self, regions: List[Dict], image_shape: Optional[tuple] = None, image_path: Optional[Path] = None):
         """주어진 감지 결과에서 toy_car_class 우선순위(1,4,3,6)를 적용하여 선택합니다.
+        선택 시 환경변수 `TOY_CAR_MIN_AREA_RATIO`가 설정되어 있으면 클래스 3 또는 6에 대해
+        해당 비율 이상인 박스가 존재해야 선택합니다.
         반환: (toy_car_class or None, present_cls set)
         """
         present_cls = {r.get("class_id") for r in regions if r.get("class_id") is not None}
+        # 기본 우선순위
+        toy_car_class = None
         if 1 in present_cls:
             toy_car_class = 1
         elif 4 in present_cls:
             toy_car_class = 4
-        elif 3 in present_cls:
-            toy_car_class = 3
-        elif 6 in present_cls:
-            toy_car_class = 6
-        else:
-            toy_car_class = None
+        elif 3 in present_cls or 6 in present_cls:
+            # 3 또는 6은 이미지 내에서 충분히 큰 박스가 있을 때만 차량으로 간주할 수 있음
+            if self.toycar_min_area_ratio and (3 in present_cls or 6 in present_cls):
+                # determine image area
+                ih, iw = None, None
+                if image_shape:
+                    ih, iw = image_shape[0], image_shape[1]
+                elif image_path:
+                    img = cv2.imread(str(image_path))
+                    if img is not None:
+                        ih, iw = img.shape[:2]
+                if ih and iw:
+                    img_area = ih * iw
+                    # find max area among cls 3 or 6
+                    max_area = 0
+                    max_cls = None
+                    for r in regions:
+                        cid = r.get("class_id")
+                        if cid in (3, 6):
+                            x1, y1, x2, y2 = r.get("bbox", [0, 0, 0, 0])
+                            area = max(0, (x2 - x1)) * max(0, (y2 - y1))
+                            if area > max_area:
+                                max_area = area
+                                max_cls = cid
+                    if max_area >= img_area * self.toycar_min_area_ratio:
+                        toy_car_class = max_cls
+                    else:
+                        toy_car_class = None
+                else:
+                    # 이미지 크기를 알 수 없으면 보수적으로 선택하지 않음
+                    toy_car_class = None
+            else:
+                # no area restriction -> choose 3 if present else 6
+                if 3 in present_cls:
+                    toy_car_class = 3
+                elif 6 in present_cls:
+                    toy_car_class = 6
+        # else toy_car_class remains None
+        self.logger.log(f"[SELECT] present_cls={present_cls} -> toy_car_class={toy_car_class}")
         return toy_car_class, present_cls
 
     def predict_anomalies_for(self, image_path: Path, regions: List[Dict], targets: Optional[set] = None):

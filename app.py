@@ -311,7 +311,7 @@ try:
         yolo_model=os.environ.get(
             "YOLO_MODEL_PATH", os.path.join("models", "yolo_weights", "best.pt")
         ),
-        sam_model=os.environ.get("SAM_MODEL_PATH", "FastSAM-s.pt"),
+        sam_model=os.environ.get("SAM_MODEL_PATH", "models/sam/FastSAM-s.pt"),
         sam_prompt=os.environ.get("SAM_PROMPT", "car"),
         anomaly_threshold=float(os.environ.get("ANOMALY_THRESHOLD", 33.08)),
         patchcore_ckpt=os.environ.get(
@@ -423,8 +423,8 @@ def process_image(
             )
             # 결과 집계
             car_regions = results if isinstance(results, list) else []
-            # pipeline에 위임된 선별 로직 사용: toy_car_class 선택
-            toy_car_class, present_cls = _SCRATCH_PIPELINE.select_toy_car_class(car_regions)
+            # pipeline에 위임된 선별 로직 사용: toy_car_class 선택 (이미지 경로 제공)
+            toy_car_class, present_cls = _SCRATCH_PIPELINE.select_toy_car_class(car_regions, image_path=Path(tmp_path))
             toy_car_exists = toy_car_class is not None
             dlogger.log(f"[DEBUG] present_cls={present_cls} -> toy_car_class={toy_car_class}", level="debug")
             if not toy_car_exists:

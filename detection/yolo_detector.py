@@ -12,10 +12,13 @@ class YOLODetector:
         self.imgsz = imgsz
         self.model = YOLO(model_path)
 
-    def detect(self, image_path) -> List[Dict]:
+    def detect(self, image_path, conf_override: float = None) -> List[Dict]:
+        """Detect boxes. If `conf_override` is provided, use it as the model confidence threshold.
+        """
+        conf_to_use = float(conf_override) if conf_override is not None else self.conf
         results = self.model.predict(
             source=str(image_path),
-            conf=self.conf,
+            conf=conf_to_use,
             imgsz=self.imgsz,
             device=self.device,
             verbose=False,

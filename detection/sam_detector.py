@@ -8,7 +8,7 @@ from ultralytics import FastSAM
 class SAMDetector:
     def __init__(
         self,
-        model_path: str = "FastSAM-s.pt",
+        model_path: str = "models/sam/FastSAM-s.pt",
         prompt: str = "toy car",
         device: str = "cuda",
         conf: float = 0.45,
@@ -26,7 +26,7 @@ class SAMDetector:
         self.min_aspect = float(os.getenv("SAM_MIN_ASPECT", 0.3))
         self.max_aspect = float(os.getenv("SAM_MAX_ASPECT", 3.0))
         self.model = FastSAM(model_path)
-    def detect(self, image_path, return_image: bool = False) -> Union[List[Dict], Tuple[List[Dict], "cv2.Mat"]]:
+    def detect(self, image_path, return_image: bool = False, **kwargs) -> Union[List[Dict], Tuple[List[Dict], "cv2.Mat"]]:
         """Run FastSAM and return detections (and optionally an annotated BGR image).
 
         return_image=True gives you a copy of the original image with only boxes drawn,
@@ -36,6 +36,7 @@ class SAMDetector:
         if image is None:
             raise ValueError(f"이미지를 로드할 수 없습니다: {image_path}")
 
+        # accept and ignore conf_override for API compatibility with YOLO detector
         results = self.model(
             source=str(image_path),
             texts=[self.prompt],

@@ -9,7 +9,7 @@ logger = DailyLogger()
 from detection.sam_detector import SAMDetector
 
 
-detector = SAMDetector(model_path="FastSAM-s.pt", prompt="toy car", device="cuda", conf=0.85, imgsz=640)
+detector = SAMDetector(model_path="models/sam/FastSAM-s.pt", prompt="toy car", device="cuda", conf=0.85, imgsz=640)
 
 
 def run_on_image(source: Path) -> None:
