@@ -423,35 +423,45 @@ def process_image(
             )
             # 결과 집계
             car_regions = results if isinstance(results, list) else []
-            # 자동차(cls=1,2)가 감지되지 않으면 pass 처리
-            car_detected = any(r.get("class_id") in (1, 2) for r in car_regions)
-            if not car_detected:
+            # pipeline에 위임된 선별 로직 사용: toy_car_class 선택
+            toy_car_class, present_cls = _SCRATCH_PIPELINE.select_toy_car_class(car_regions)
+            toy_car_exists = toy_car_class is not None
+            dlogger.log(f"[DEBUG] present_cls={present_cls} -> toy_car_class={toy_car_class}", level="debug")
+            if not toy_car_exists:
                 scratch_result = {
                     "success": False,
                     "result_image": (f"data:image/jpeg;base64,{img_base64}" if _FORCE_DATA_URI_PREFIX else img_base64),
                     "car_regions": car_regions,
                     "result": "pass",
-                    "reason": "no car (cls=1,2) detected",
+                    "reason": f"no car (cls in {sorted(list(present_cls))} -> none of 1,4,3,6)",
                 }
-                dlogger.log("[DEBUG] pipeline summary: no car (cls=1,2) detected, pass", level="debug")
+                dlogger.log("[DEBUG] pipeline summary: no car (cls=1,3,4,6) detected, pass", level="debug")
             else:
-                scratch_count = sum(1 for r in car_regions if r.get("class_id") == 5)
-                broken_count = 0  # 필요시 클래스별로 집계
-                separated_count = sum(1 for r in car_regions if r.get("class_id") == 6)
+                # 선택된 toy_car_class에 대해서만 anomaly 실행
+                augmented = _SCRATCH_PIPELINE.predict_anomalies_for(Path(tmp_path), car_regions, targets={toy_car_class})
+                # 집계: scratch(5), broken(placeholder), separated(6)
+                scratch_count = sum(1 for r in augmented if r.get("class_id") == 5)
+                broken_count = 0
+                separated_count = sum(1 for r in augmented if r.get("class_id") == 6)
+                # anomaly_detected는 선택된 toy_car_class 영역에서의 이상 유무
+                anomaly_detected = any(
+                    (r.get("class_id") == toy_car_class and r.get("anomaly") and r["anomaly"].get("is_anomaly"))
+                    for r in augmented
+                )
                 scratch_result = {
                     "success": True,
                     "result_image": (f"data:image/jpeg;base64,{img_base64}" if _FORCE_DATA_URI_PREFIX else img_base64),
                     "scratch_detected": bool(scratch_count),
                     "broken_detected": bool(broken_count),
                     "separated_detected": bool(separated_count),
-                    "anomaly_detected": bool(scratch_count),
+                    "anomaly_detected": bool(anomaly_detected),
                     "scratch_count": scratch_count,
                     "broken_count": broken_count,
                     "separated_count": separated_count,
-                    "car_regions": car_regions,
-                    "result": ("defect" if scratch_count > 0 else "ok"),
+                    "car_regions": augmented,
+                    "result": ("defect" if anomaly_detected else "ok"),
                 }
-                dlogger.log(f"[DEBUG] pipeline summary: scratch_count={scratch_count}", level="debug")
+                dlogger.log(f"[DEBUG] pipeline summary: toy_car_class={toy_car_class} anomaly_detected={anomaly_detected}", level="debug")
             try:
                 os.unlink(tmp_path)
             except Exception:

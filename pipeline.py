@@ -133,12 +133,17 @@ class Pipeline:
         regions = self.detector.detect(image_path)
         self.logger.log(f"Detected regions: {len(regions)}")
 
-        # 2. 차량 존재 여부 판단: 클래스 1 또는 4가 우선 (1 우선).
+        # 2. 차량 존재 여부 판단 우선순위:
+        # 1 (toy_car) 우선, 그 다음 4 (toycar_housing), 그 다음 3, 그 다음 6.
         present_cls = {reg.get("class_id") for reg in regions if reg.get("class_id") is not None}
         if 1 in present_cls:
             toy_car_class = 1
         elif 4 in present_cls:
             toy_car_class = 4
+        elif 3 in present_cls:
+            toy_car_class = 3
+        elif 6 in present_cls:
+            toy_car_class = 6
         else:
             toy_car_class = None
         toy_car_exists = toy_car_class is not None
@@ -146,7 +151,6 @@ class Pipeline:
         # SHOW_IGNORED_CLASSES 환경변수가 true이면 cls 3,4를 임시로 legend와 bbox에 표시
         show_ignored = os.getenv("SHOW_IGNORED_CLASSES", "true").lower() in ("1", "true", "yes")
 
-        # 3. anomaly 탐색 (차량(1 또는 4) 존재 시 해당 영역에 대해서만)
         class_colors = {
             0: (0, 255, 0),  # green
             1: (0, 0, 255),  # red
@@ -159,9 +163,8 @@ class Pipeline:
         # 클래스 이름 매핑: 1->toy_car, 4->toycar_housing, 3->car_floor, 5->scratch, 6->separated
         class_names = {1: "toy_car", 4: "toycar_housing", 3: "car_floor", 5: "scratch", 6: "separated"}
 
-        # anomaly targets: only vehicle-related classes 1 or 4
-        anomaly_targets = {c for c in (1, 4) if c in present_cls} if toy_car_exists else set()
-
+        # pipeline은 이제 감지 결과(클래스, bbox, conf)만 반환합니다.
+        # 애플리케이션 레이어에서 이미지 수준 판정이나 anomaly 실행을 담당합니다.
         results: List[Dict] = []
         for i, reg in enumerate(regions):
             bbox = reg["bbox"]
@@ -170,29 +173,8 @@ class Pipeline:
                 "bbox": bbox,
                 "conf": reg.get("conf"),
                 "class_id": cls_id,
-                "anomaly": None,
             }
-
-            # anomaly는 anomaly_targets(1 또는 4)에 속한 클래스에 대해서만 계산
-            if (
-                cls_id in anomaly_targets
-                and self.anomaly
-                and (
-                    self.anomaly_backend == "patchcore"
-                    or self.anomaly_backend == "efficientad"
-                )
-            ):
-                anomaly = self.anomaly.predict_crop(
-                    image, bbox, threshold=self.anomaly_threshold
-                )
-                out["anomaly"] = anomaly
-                tag = "DEFECT" if anomaly["is_anomaly"] else "OK"
-                self.logger.log(
-                    f"[{i}] cls={cls_id} score={anomaly['score']:.2f} -> {tag}"
-                )
-            else:
-                self.logger.log(f"[{i}] cls={cls_id} (anomaly backend skipped)")
-
+            self.logger.log(f"[{i}] cls={cls_id} (detected, anomaly skipped in pipeline)")
             results.append(out)
 
             # bbox 그리기 규칙:
@@ -285,25 +267,50 @@ class Pipeline:
             cv2.imshow("result", image)
             cv2.waitKey(1)
 
-        # 이미지 수준의 요약 결과 계산:
-        # - toy_car(class 3 or 4)가 없으면 'pass'
-        # - toy_car가 있으면, toy_car 영역 중 anomaly가 감지된 경우에만 'defect', 아니면 'ok'
-        if not toy_car_exists:
-            image_result = "pass"
-        else:
-            defect_detected = any(
-                (
-                    r.get("class_id") == toy_car_class
-                    and r.get("anomaly")
-                    and r["anomaly"].get("is_anomaly")
-                )
-                for r in results
-            )
-            image_result = "defect" if defect_detected else "ok"
-
-        # 결과를 날짜별 파일에 자동 저장 (최상위 result 포함)
-        self.logger.save_result({"image": str(image_path), "results": results, "result": image_result})
+        # 결과를 날짜별 파일에 자동 저장 (이미지별 원시 감지 결과)
+        self.logger.save_result({"image": str(image_path), "results": results})
         return results
+
+    def select_toy_car_class(self, regions: List[Dict]):
+        """주어진 감지 결과에서 toy_car_class 우선순위(1,4,3,6)를 적용하여 선택합니다.
+        반환: (toy_car_class or None, present_cls set)
+        """
+        present_cls = {r.get("class_id") for r in regions if r.get("class_id") is not None}
+        if 1 in present_cls:
+            toy_car_class = 1
+        elif 4 in present_cls:
+            toy_car_class = 4
+        elif 3 in present_cls:
+            toy_car_class = 3
+        elif 6 in present_cls:
+            toy_car_class = 6
+        else:
+            toy_car_class = None
+        return toy_car_class, present_cls
+
+    def predict_anomalies_for(self, image_path: Path, regions: List[Dict], targets: Optional[set] = None):
+        """주어진 regions에 대해 anomaly backend를 실행하여 'anomaly' 필드를 추가한 결과를 반환합니다.
+        targets: 클래스 ID 집합만 처리 (None이면 모든 클래스 처리)
+        """
+        image = cv2.imread(str(image_path))
+        if image is None:
+            raise ValueError(f"이미지를 로드할 수 없습니다: {image_path}")
+        augmented = []
+        for i, r in enumerate(regions):
+            out = dict(r)
+            cls_id = out.get("class_id")
+            if targets is None or cls_id in targets:
+                if self.anomaly and (self.anomaly_backend in ("patchcore", "efficientad")):
+                    anomaly = self.anomaly.predict_crop(image, out["bbox"], threshold=self.anomaly_threshold)
+                    out["anomaly"] = anomaly
+                    tag = "DEFECT" if anomaly.get("is_anomaly") else "OK"
+                    self.logger.log(f"[anomaly] idx={i} cls={cls_id} score={anomaly.get('score'):.2f} -> {tag}")
+                else:
+                    out["anomaly"] = None
+            else:
+                out["anomaly"] = None
+            augmented.append(out)
+        return augmented
 
     def run_directory(self, source_dir: Path, save_dir: Optional[Path] = None):
         exts = {".jpg", ".jpeg", ".png", ".bmp"}
