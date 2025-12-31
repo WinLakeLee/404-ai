@@ -56,67 +56,59 @@ app.config["MQTT_CLEAN_SESSION"] = True
 _MQTT_CLIENT = None
 try:
 
-    def _on_message(client, userdata, message):
+    def _normalize_payload(data: bytes):
+        from mqtt_utils import find_base64_image
+        return find_base64_image(data)
 
+    def _on_message(client, userdata, message):
         def _task():
             # Normalize/decode MQTT payload (handle hex, JSON with base64, raw base64)
-            def _normalize_payload(data: bytes) -> bytes:
-                # If not decodable as text, return raw bytes
-                try:
-                    s = data.decode("utf-8").strip()
-                except Exception:
-                    return data
 
-                # JSON object containing a base64 image
-                if s.startswith("{") or s.startswith("["):
-                    try:
-                        obj = json.loads(s)
-                        if isinstance(obj, dict):
-                            for key in ("image", "payload", "data"):
-                                if key in obj and isinstance(obj[key], str):
-                                    b64 = obj[key].strip()
-                                    # data URI
-                                    if b64.startswith("data:") and "base64," in b64:
-                                        try:
-                                            return base64.b64decode(
-                                                b64.split("base64,", 1)[1]
-                                            )
-                                        except Exception:
-                                            pass
-                                    try:
-                                        return base64.b64decode(b64, validate=True)
-                                    except Exception:
-                                        pass
-                    except Exception:
-                        pass
-
-                # Hex string (e.g., '7b226361' -> b'{"ca')
-                if re.fullmatch(r"[0-9a-fA-F]+", s) and len(s) % 2 == 0:
-                    try:
-                        return bytes.fromhex(s)
-                    except Exception:
-                        pass
-
-                # Raw base64 string
-                try:
-                    return base64.b64decode(s, validate=True)
-                except Exception:
-                    pass
-
-                return data
-
-            payload = _normalize_payload(message.payload)
+            payload_result = _normalize_payload(message.payload)
+            print(f"[MQTT DEBUG] find_base64_image result type: {type(payload_result)}")
+            if isinstance(payload_result, dict) and "image" in payload_result:
+                img_val = payload_result["image"]
+                if isinstance(img_val, list):
+                    print(f"[MQTT DEBUG] image count: {len(img_val)}; sizes: {[len(b) for b in img_val]}")
+                elif isinstance(img_val, bytes):
+                    print(f"[MQTT DEBUG] single image size: {len(img_val)}")
+                else:
+                    print(f"[MQTT DEBUG] image value type: {type(img_val)}")
+            else:
+                print(f"[MQTT DEBUG] payload_result: {payload_result}")
+            # 실제 이미지 바이트만 추출
+            if isinstance(payload_result, dict) and "image" in payload_result:
+                if isinstance(payload_result["image"], list):
+                    payload = payload_result["image"][0] if payload_result["image"] else b""
+                else:
+                    payload = payload_result["image"]
+            else:
+                payload = payload_result
 
             # Optional ACK/heartbeat to indicate message received
             try:
+                # ACK: identify broker (use full broker string, not first char)
                 publish_with_client(
                     _MQTT_CLIENT,
-                    {"id": _MQTT_BROKER[0], "timestamp": datetime.now().isoformat()},
+                    {"id": _MQTT_BROKER, "timestamp": datetime.now().isoformat()},
                     topic=_OUT_TOPIC,
                     qos=_OUT_QOS,
                 )
             except Exception:
                 publish_mqtt(payload={"error": ConnectionRefusedError()})
+
+            # 추가 디버그: 추출된 payload 정보(타입/크기/헤드)를 로그에 남겨 문제 원인 파악에 도움
+            try:
+                if isinstance(payload, (bytes, bytearray)):
+                    plen = len(payload)
+                    print(f"[MQTT DEBUG] extracted payload type={type(payload)}, len={plen}")
+                    if plen:
+                        print(f"[MQTT DEBUG] payload head hex: {payload[:32].hex()}")
+                else:
+                    s = str(payload)
+                    print(f"[MQTT DEBUG] extracted payload type={type(payload)}, repr head={s[:128]!r}")
+            except Exception as _e:
+                print(f"[MQTT DEBUG] payload debug failed: {_e}")
 
             # 포맷 검증은 강제하지 않음 — 가능한 경우 메타정보를 얻고, 실패 시 기본값을 사용
             img_info = validate_image_format(payload)
@@ -442,6 +434,7 @@ def detect():
     images = []
     if request.is_json:
         req_json = request.get_json()
+        print("[DEBUG] /detect JSON payload:", json.dumps(req_json, ensure_ascii=False))
         images = req_json.get("images", [])
         # images가 없으면 에러
         if not images:

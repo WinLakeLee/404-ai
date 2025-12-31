@@ -1,3 +1,122 @@
+def find_base64_image(data: bytes, max_depth=3) -> bytes:
+    """
+    여러 번 base64 디코딩을 반복하여 이미지 매직넘버가 나올 때까지 시도
+    """
+    import base64
+    import json
+    from PIL import Image
+    import io
+    # 이미지 매직넘버 및 픽셀 크기 확인
+    def is_image_bytes(b: bytes) -> bool:
+        try:
+            img = Image.open(io.BytesIO(b))
+            w, h = img.size
+            return w > 0 and h > 0
+        except Exception:
+            return False
+
+    # dict에서 이미지 후보 추출
+    def extract_image_from_dict(obj):
+        # 이미지로 간주할 key name 확장
+        keys = [
+            "image", "images", "photo", "picture", "img", "file", "frame", "content", "data", "buffer"
+        ]
+        found = []
+        for k in keys:
+            if k in obj:
+                print(f"[MQTT DEBUG] extract_image_from_dict found key={k}")
+                v = obj[k]
+                # list of items: items can be strings, bytes, or nested dicts
+                if isinstance(v, list):
+                    for item in v:
+                        # if item is dict like {"image": "..."}, try recursively
+                        if isinstance(item, dict):
+                            nested = extract_image_from_dict(item)
+                            if nested:
+                                found.extend(nested)
+                                continue
+                        b = try_parse_image(item)
+                        if b is not None:
+                            found.append(b)
+                elif isinstance(v, dict):
+                    nested = extract_image_from_dict(v)
+                    if nested:
+                        found.extend(nested)
+                else:
+                    b = try_parse_image(v)
+                    if b is not None:
+                        found.append(b)
+        return found if found else None
+
+    def try_parse_image(val):
+        # 문자열이면 base64 디코딩 시도
+        # dict이면 내부 키를 탐색
+        if isinstance(val, dict):
+            nested = extract_image_from_dict(val)
+            if nested:
+                print(f"[MQTT DEBUG] try_parse_image: parsed nested dict, found {len(nested)} images")
+                return nested[0]
+        if isinstance(val, str):
+            s = val.strip()
+            if s.startswith("data:") and "base64," in s:
+                s = s.split("base64,", 1)[1]
+            try:
+                b = base64.b64decode(s, validate=True)
+                print(f"[MQTT DEBUG] try_parse_image: decoded string -> {len(b)} bytes, head={b[:16].hex()}" )
+                if is_image_bytes(b):
+                    print(f"[MQTT DEBUG] try_parse_image: valid image (w>0,h>0) after decode")
+                    return b
+            except Exception:
+                print(f"[MQTT DEBUG] try_parse_image: base64 decode failed for candidate (len={len(s)})")
+                pass
+        # bytes면 바로 확인
+        if isinstance(val, bytes):
+            print(f"[MQTT DEBUG] try_parse_image: candidate bytes len={len(val)}, head={val[:16].hex()}")
+            if is_image_bytes(val):
+                print(f"[MQTT DEBUG] try_parse_image: candidate bytes is valid image")
+                return val
+        return None
+
+    current = data
+    for _ in range(max_depth):
+        # 1. bytes가 이미지면 리스트로 반환
+        try:
+            if is_image_bytes(current):
+                print(f"[MQTT DEBUG] find_base64_image: input is image bytes ({len(current)} bytes), head={current[:16].hex()}")
+                return {"image": current}
+        except Exception:
+            pass
+        # 2. 텍스트로 변환해서 dict 구조면 key 탐색
+        try:
+            s = current.decode("utf-8", errors="ignore").strip()
+            if s.startswith("{") or s.startswith("["):
+                try:
+                    obj = json.loads(s)
+                    if isinstance(obj, dict):
+                        found = extract_image_from_dict(obj)
+                        if found is not None and len(found) > 0:
+                            if len(found) == 1:
+                                return {"image": found[0]}
+                            else:
+                                return {"image": found}
+                except Exception:
+                    print("[MQTT DEBUG] JSON loads failed during payload parse")
+                    pass
+        except Exception:
+            print("[MQTT DEBUG] find_base64_image: decode to text failed or not JSON")
+            pass
+        # 3. base64 디코딩 반복
+        try:
+            s = current.decode("utf-8", errors="ignore").strip()
+            b64 = s.split("base64,", 1)[1] if "base64," in s else s
+            print(f"[MQTT DEBUG] find_base64_image: attempting base64 decode on len={len(b64)}")
+            current = base64.b64decode(b64, validate=True)
+            print(f"[MQTT DEBUG] find_base64_image: decoded -> {len(current)} bytes, head={current[:16].hex()}")
+        except Exception:
+            print("[MQTT DEBUG] find_base64_image: iterative base64 decode failed — stopping")
+            break
+    # 실패 시 빈 리스트 반환
+    return {"image": []}
 import os
 import json
 import uuid
