@@ -80,14 +80,23 @@ _MQTT_CLIENT = None
 # Start a background monitor that periodically prints MQTT connection info.
 def _start_mqtt_monitor(interval: int = 10):
     def _monitor():
+        prev_connected = None
         while True:
             try:
                 connected = is_client_connected(_MQTT_CLIENT)
                 now = datetime.now().isoformat()
-                dlogger.log(
-                    f"[{now}] MQTT status: connected={connected} broker={_MQTT_BROKER}:{_MQTT_PORT} in_topic={_IN_TOPIC} out_topic={_OUT_TOPIC}",
-                    level="info",
-                )
+                # Log only on state change (or first check)
+                if prev_connected is None:
+                    dlogger.log(
+                        f"[{now}] MQTT status: connected={connected} broker={_MQTT_BROKER}:{_MQTT_PORT} in_topic={_IN_TOPIC} out_topic={_OUT_TOPIC}",
+                        level="info",
+                    )
+                elif connected != prev_connected:
+                    dlogger.log(
+                        f"[{now}] MQTT status changed: connected={connected} broker={_MQTT_BROKER}:{_MQTT_PORT}",
+                        level="info",
+                    )
+                prev_connected = connected
             except Exception:
                 dlogger.log(f"[{datetime.now().isoformat()}] MQTT status: check failed", level="warning")
             time.sleep(interval)
