@@ -411,6 +411,136 @@ def publish_with_client(mqtt_client, payload: dict, topic: str = None, qos: int 
         return False
 
 
+def start_paho_listener(
+    process_image_cb,
+    validate_image_format_cb,
+    aggregate_fn,
+    upload_dir: str,
+    upload_counter,
+    upload_counter_lock,
+    logger,
+    executor=None,
+    broker: str = None,
+    port: int = None,
+    use_tls: bool = False,
+    in_topic: str = None,
+    out_topic: str = None,
+    out_qos: int = 1,
+    send_ack: bool = False,
+    ack_topic: str = None,
+):
+    """
+    Create and start a paho client that listens to `in_topic`, decodes images
+    using `find_base64_image`, processes each image via `process_image_cb`,
+    and publishes aggregated results via `publish_with_client`/`publish_mqtt`.
+
+    Returns the paho client instance (may be partially initialized if connect fails).
+    """
+    broker = broker or os.environ.get("MQTT_BROKER") or "localhost"
+    port = int(port or os.environ.get("MQTT_PORT") or 1883)
+    in_topic = in_topic or os.environ.get("IN_MQTT_TOPIC") or "camera01/control"
+    out_topic = out_topic or os.environ.get("MQTT_TOPIC") or "camera01/result"
+    out_qos = int(out_qos or os.environ.get("OUT_MQTT_QOS") or os.environ.get("MQTT_QOS") or 1)
+
+    def _normalize_payload(data: bytes):
+        return find_base64_image(data)
+
+    def _on_message(client, userdata, message):
+        def _task():
+            try:
+                payload_result = _normalize_payload(message.payload)
+                logger.log(f"[MQTT DEBUG] find_base64_image result type: {type(payload_result)}", level="debug")
+                images = []
+                if isinstance(payload_result, dict) and "image" in payload_result:
+                    img_val = payload_result["image"]
+                    if isinstance(img_val, list):
+                        images = img_val
+                    else:
+                        images = [img_val]
+                else:
+                    images = [payload_result]
+
+                # optional ack
+                try:
+                    if send_ack:
+                        ack_t = ack_topic or f"{out_topic}_ack"
+                        publish_with_client(client, {"id": broker, "timestamp": datetime.now().isoformat()}, topic=ack_t, qos=out_qos)
+                except Exception:
+                    try:
+                        publish_mqtt({"error": "ack_failed"})
+                    except Exception:
+                        pass
+
+                responses = []
+                non_pass_responses = []
+                for idx, payload in enumerate(images, start=1):
+                    try:
+                        if isinstance(payload, (bytes, bytearray)):
+                            plen = len(payload)
+                            logger.log(f"[MQTT DEBUG] extracted payload type={type(payload)}, len={plen}", level="debug")
+                            if plen:
+                                logger.log(f"[MQTT DEBUG] payload head hex: {payload[:32].hex()}", level="debug")
+                        else:
+                            s = str(payload)
+                            logger.log(f"[MQTT DEBUG] extracted payload type={type(payload)}, repr head={s[:128]!r}", level="debug")
+                    except Exception as _e:
+                        logger.log(f"[MQTT DEBUG] payload debug failed: {_e}", level="debug")
+
+                    img_info = validate_image_format_cb(payload)
+                    if not img_info.get("valid"):
+                        img_info = {
+                            "valid": True,
+                            "format": "jpg",
+                            "extension": ".jpg",
+                            "mime_type": "image/jpeg",
+                            "size": len(payload) if isinstance(payload, (bytes, bytearray)) else 0,
+                            "width": 0,
+                            "height": 0,
+                        }
+
+                    base_name = f"mqtt_{message.topic.replace('/', '_')}"
+                    if len(images) > 1:
+                        filename = f"{base_name}_{idx}{img_info['extension']}"
+                    else:
+                        filename = f"{base_name}{img_info['extension']}"
+                    logger.log(f"✅ MQTT 이미지 수신: {filename} ({img_info.get('width',0)}x{img_info.get('height',0)}, {img_info.get('size',0)} bytes)", level="info")
+
+                    resp = process_image_cb(payload, filename, img_info.get("mime_type"))
+                    responses.append(resp)
+                    if resp.get("detection", {}).get("result") != "pass":
+                        non_pass_responses.append(resp)
+                    else:
+                        logger.log(f"Image {idx} detection result == 'pass' (no car); skip publish for this image unless another requires publish)", level="debug")
+
+                if len(non_pass_responses) == 0:
+                    logger.log("MQTT publish skipped: all images result == 'pass' (no car)", level="info")
+                else:
+                    aggregated = aggregate_fn(responses, include_images=True)
+                    try:
+                        publish_with_client(client, aggregated, topic=out_topic, qos=out_qos)
+                    except Exception:
+                        publish_mqtt(aggregated)
+            except Exception:
+                logger.log("Exception in mqtt on_message handler", level="error")
+
+        if executor is not None:
+            executor.submit(_task)
+        else:
+            _task()
+
+    paho_client = create_paho_client(
+        on_message_cb=_on_message,
+        broker=broker,
+        port=port,
+        use_tls=use_tls,
+        subscribe_topic=in_topic,
+        qos=out_qos,
+        start_loop=True,
+    )
+
+    return paho_client
+
+
 def is_client_connected(mqtt_client) -> bool:
     """Return True if the provided paho `mqtt_client` appears connected.
 

@@ -133,11 +133,20 @@ class Pipeline:
         regions = self.detector.detect(image_path)
         self.logger.log(f"Detected regions: {len(regions)}")
 
-        # 2. toy_car(class_id=1,2) 존재 여부 판단
-        toy_car_exists = any(reg.get("class_id") in (1, 2) for reg in regions)
-        self.logger.log(f"[STEP] toy_car exists: {toy_car_exists}")
+        # 2. 차량 존재 여부 판단: 클래스 1 또는 4가 우선 (1 우선).
+        present_cls = {reg.get("class_id") for reg in regions if reg.get("class_id") is not None}
+        if 1 in present_cls:
+            toy_car_class = 1
+        elif 4 in present_cls:
+            toy_car_class = 4
+        else:
+            toy_car_class = None
+        toy_car_exists = toy_car_class is not None
+        self.logger.log(f"[STEP] present_cls={present_cls} -> toy_car_class={toy_car_class}")
+        # SHOW_IGNORED_CLASSES 환경변수가 true이면 cls 3,4를 임시로 legend와 bbox에 표시
+        show_ignored = os.getenv("SHOW_IGNORED_CLASSES", "true").lower() in ("1", "true", "yes")
 
-        # 3. anomaly 탐색 (toy_car 있을 때만)
+        # 3. anomaly 탐색 (차량(1 또는 4) 존재 시 해당 영역에 대해서만)
         class_colors = {
             0: (0, 255, 0),  # green
             1: (0, 0, 255),  # red
@@ -147,7 +156,11 @@ class Pipeline:
             5: (255, 255, 0),  # cyan
             6: (128, 128, 128),  # gray
         }
-        class_names = {5: "scratch", 6: "separated"}
+        # 클래스 이름 매핑: 1->toy_car, 4->toycar_housing, 3->car_floor, 5->scratch, 6->separated
+        class_names = {1: "toy_car", 4: "toycar_housing", 3: "car_floor", 5: "scratch", 6: "separated"}
+
+        # anomaly targets: only vehicle-related classes 1 or 4
+        anomaly_targets = {c for c in (1, 4) if c in present_cls} if toy_car_exists else set()
 
         results: List[Dict] = []
         for i, reg in enumerate(regions):
@@ -160,8 +173,9 @@ class Pipeline:
                 "anomaly": None,
             }
 
+            # anomaly는 anomaly_targets(1 또는 4)에 속한 클래스에 대해서만 계산
             if (
-                toy_car_exists
+                cls_id in anomaly_targets
                 and self.anomaly
                 and (
                     self.anomaly_backend == "patchcore"
@@ -181,8 +195,18 @@ class Pipeline:
 
             results.append(out)
 
-            # cls=5,6만 bbox 그림
-            if cls_id in (5, 6):
+            # bbox 그리기 규칙:
+            # - 항상 cls 5,6(scratch/separated)는 그림
+            # - cls 1(toy_car)와 cls 4(toycar_housing)는 표시
+            # - cls 3(car_floor)는 cls 4가 없을 때만 표시
+            # - cls 2는 기본적으로 무시(표시하려면 SHOW_IGNORED_CLASSES)
+            draw_cls3 = (cls_id == 3 and 4 not in {r.get("class_id") for r in regions})
+            if (
+                cls_id in (5, 6)
+                or cls_id in (1, 4)
+                or draw_cls3
+                or (show_ignored and cls_id == 2)
+            ):
                 x1, y1, x2, y2 = bbox
                 color = class_colors.get(cls_id, (0, 255, 0))
                 cv2.rectangle(image, (x1, y1), (x2, y2), color, 2)
@@ -190,10 +214,16 @@ class Pipeline:
         # legend(범례) 추가: 이미지 우측하단 box, 각 class별 색상/이름
         h, w = image.shape[:2]
         legend_w = int(w * 0.3)
-        # legend에 표시할 class만 필터 (cls=5,6만)
-        legend_cls_ids = [
-            cid for cid in (5, 6) if any(reg.get("class_id") == cid for reg in regions)
-        ]
+        # legend에 표시할 클래스: 이미지에서 감지된 모든 클래스 ID를 표시
+        legend_cls_ids = {reg.get("class_id") for reg in regions if reg.get("class_id") is not None}
+        # 사용자 규칙: 기본적으로 class 3(car_floor)은 legend에서 제외
+        # SHOW_IGNORED_CLASSES가 true이면 포함시켜 임시 표시
+        if not show_ignored:
+            legend_cls_ids = {cid for cid in legend_cls_ids if cid not in (3,)}
+        # class 3과 4가 모두 있을 경우 4만 남겨서 toy_car로 단일 표기
+        if 3 in legend_cls_ids and 4 in legend_cls_ids:
+            legend_cls_ids.discard(3)
+        legend_cls_ids = sorted(legend_cls_ids)
         n_legend = len(legend_cls_ids)
         if n_legend == 0:
             n_legend = 1  # 최소 높이 확보
@@ -218,7 +248,13 @@ class Pipeline:
         color_box_w = max(int(line_height * 0.7), 12)
         color_box_h = max(int(line_height * 0.7), 12)
         for cid in legend_cls_ids:
-            cname = class_names.get(cid, str(cid))
+            # If class 4 exists alone (no class 1), show it as 'toy_car'
+            if cid == 4 and 1 not in present_cls:
+                cname = "toy_car"
+            elif cid == 1:
+                cname = "toy_car"
+            else:
+                cname = class_names.get(cid, str(cid))
             color = class_colors.get(cid, (0, 255, 0))
             box_y1 = y_offset - color_box_h // 2
             box_y2 = y_offset + color_box_h // 2 - 1
@@ -249,24 +285,21 @@ class Pipeline:
             cv2.imshow("result", image)
             cv2.waitKey(1)
 
-        # 이미지 수준의 요약 결과 계산: anomaly 또는 defect 클래스가 있으면 'defect' 아니면 'ok'
-        defect_detected = False
-        try:
-            for r in results:
-                cls_id = r.get("class_id")
-                # 클래스 기반 결함 판단 (cls=5,6는 defect 타입으로 처리)
-                if cls_id in (5, 6):
-                    defect_detected = True
-                    break
-                # anomaly 정보가 있으면 is_anomaly로 판단
-                an = r.get("anomaly")
-                if isinstance(an, dict) and an.get("is_anomaly"):
-                    defect_detected = True
-                    break
-        except Exception:
-            defect_detected = False
-
-        image_result = "defect" if defect_detected else "ok"
+        # 이미지 수준의 요약 결과 계산:
+        # - toy_car(class 3 or 4)가 없으면 'pass'
+        # - toy_car가 있으면, toy_car 영역 중 anomaly가 감지된 경우에만 'defect', 아니면 'ok'
+        if not toy_car_exists:
+            image_result = "pass"
+        else:
+            defect_detected = any(
+                (
+                    r.get("class_id") == toy_car_class
+                    and r.get("anomaly")
+                    and r["anomaly"].get("is_anomaly")
+                )
+                for r in results
+            )
+            image_result = "defect" if defect_detected else "ok"
 
         # 결과를 날짜별 파일에 자동 저장 (최상위 result 포함)
         self.logger.save_result({"image": str(image_path), "results": results, "result": image_result})
