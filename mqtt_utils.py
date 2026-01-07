@@ -1,3 +1,127 @@
+from _daily_logger import DailyLogger
+
+dlogger = DailyLogger()
+
+
+def find_base64_image(data: bytes, max_depth=3) -> bytes:
+    """
+    여러 번 base64 디코딩을 반복하여 이미지 매직넘버가 나올 때까지 시도
+    """
+    import base64
+    import json
+    from PIL import Image
+    import io
+    # 이미지 매직넘버 및 픽셀 크기 확인
+    def is_image_bytes(b: bytes) -> bool:
+        try:
+            img = Image.open(io.BytesIO(b))
+            w, h = img.size
+            return w > 0 and h > 0
+        except Exception:
+            return False
+
+    # dict에서 이미지 후보 추출
+    def extract_image_from_dict(obj):
+        # 이미지로 간주할 key name 확장
+        keys = [
+            "image", "images", "photo", "picture", "img", "file", "frame", "content", "data", "buffer"
+        ]
+        found = []
+        for k in keys:
+            if k in obj:
+                dlogger.log(f"[MQTT DEBUG] extract_image_from_dict found key={k}", level="debug")
+                v = obj[k]
+                # list of items: items can be strings, bytes, or nested dicts
+                if isinstance(v, list):
+                    for item in v:
+                        # if item is dict like {"image": "..."}, try recursively
+                        if isinstance(item, dict):
+                            nested = extract_image_from_dict(item)
+                            if nested:
+                                found.extend(nested)
+                                continue
+                        b = try_parse_image(item)
+                        if b is not None:
+                            found.append(b)
+                elif isinstance(v, dict):
+                    nested = extract_image_from_dict(v)
+                    if nested:
+                        found.extend(nested)
+                else:
+                    b = try_parse_image(v)
+                    if b is not None:
+                        found.append(b)
+        return found if found else None
+
+    def try_parse_image(val):
+        # 문자열이면 base64 디코딩 시도
+        # dict이면 내부 키를 탐색
+        if isinstance(val, dict):
+            nested = extract_image_from_dict(val)
+            if nested:
+                dlogger.log(f"[MQTT DEBUG] try_parse_image: parsed nested dict, found {len(nested)} images", level="debug")
+                return nested[0]
+        if isinstance(val, str):
+            s = val.strip()
+            if s.startswith("data:") and "base64," in s:
+                s = s.split("base64,", 1)[1]
+            try:
+                b = base64.b64decode(s, validate=True)
+                dlogger.log(f"[MQTT DEBUG] try_parse_image: decoded string -> {len(b)} bytes, head={b[:16].hex()}", level="debug")
+                if is_image_bytes(b):
+                    dlogger.log(f"[MQTT DEBUG] try_parse_image: valid image (w>0,h>0) after decode", level="debug")
+                    return b
+            except Exception:
+                dlogger.log(f"[MQTT DEBUG] try_parse_image: base64 decode failed for candidate (len={len(s)})", level="debug")
+                pass
+        # bytes면 바로 확인
+        if isinstance(val, bytes):
+            dlogger.log(f"[MQTT DEBUG] try_parse_image: candidate bytes len={len(val)}, head={val[:16].hex()}", level="debug")
+            if is_image_bytes(val):
+                dlogger.log(f"[MQTT DEBUG] try_parse_image: candidate bytes is valid image", level="debug")
+                return val
+        return None
+
+    current = data
+    for _ in range(max_depth):
+        # 1. bytes가 이미지면 리스트로 반환
+        try:
+            if is_image_bytes(current):
+                dlogger.log(f"[MQTT DEBUG] find_base64_image: input is image bytes ({len(current)} bytes), head={current[:16].hex()}", level="debug")
+                return {"image": current}
+        except Exception:
+            pass
+        # 2. 텍스트로 변환해서 dict 구조면 key 탐색
+        try:
+            s = current.decode("utf-8", errors="ignore").strip()
+            if s.startswith("{") or s.startswith("["):
+                try:
+                    obj = json.loads(s)
+                    if isinstance(obj, dict):
+                        found = extract_image_from_dict(obj)
+                        if found is not None and len(found) > 0:
+                            if len(found) == 1:
+                                return {"image": found[0]}
+                            else:
+                                return {"image": found}
+                except Exception:
+                    dlogger.log("[MQTT DEBUG] JSON loads failed during payload parse", level="debug")
+                    pass
+        except Exception:
+            dlogger.log("[MQTT DEBUG] find_base64_image: decode to text failed or not JSON", level="debug")
+            pass
+        # 3. base64 디코딩 반복
+        try:
+            s = current.decode("utf-8", errors="ignore").strip()
+            b64 = s.split("base64,", 1)[1] if "base64," in s else s
+            dlogger.log(f"[MQTT DEBUG] find_base64_image: attempting base64 decode on len={len(b64)}", level="debug")
+            current = base64.b64decode(b64, validate=True)
+            dlogger.log(f"[MQTT DEBUG] find_base64_image: decoded -> {len(current)} bytes, head={current[:16].hex()}", level="debug")
+        except Exception:
+            dlogger.log("[MQTT DEBUG] find_base64_image: iterative base64 decode failed — stopping", level="debug")
+            break
+    # 실패 시 빈 리스트 반환
+    return {"image": []}
 import os
 import json
 import uuid
@@ -18,7 +142,7 @@ def _do_publish(payload: dict) -> bool:
 
     broker = os.environ.get('MQTT_BROKER', 'localhost')
     port = int(os.environ.get('MQTT_PORT', 1883))
-    topic = os.environ.get('MQTT_TOPIC', '404ai/detections')
+    topic = os.environ.get('MQTT_TOPIC', 'camera01/result')
     qos = int(os.environ.get('MQTT_QOS', 1))
     username = os.environ.get('MQTT_USERNAME')
     password = os.environ.get('MQTT_PASSWORD')
@@ -287,6 +411,136 @@ def publish_with_client(mqtt_client, payload: dict, topic: str = None, qos: int 
         return False
 
 
+def start_paho_listener(
+    process_image_cb,
+    validate_image_format_cb,
+    aggregate_fn,
+    upload_dir: str,
+    upload_counter,
+    upload_counter_lock,
+    logger,
+    executor=None,
+    broker: str = None,
+    port: int = None,
+    use_tls: bool = False,
+    in_topic: str = None,
+    out_topic: str = None,
+    out_qos: int = 1,
+    send_ack: bool = False,
+    ack_topic: str = None,
+):
+    """
+    Create and start a paho client that listens to `in_topic`, decodes images
+    using `find_base64_image`, processes each image via `process_image_cb`,
+    and publishes aggregated results via `publish_with_client`/`publish_mqtt`.
+
+    Returns the paho client instance (may be partially initialized if connect fails).
+    """
+    broker = broker or os.environ.get("MQTT_BROKER") or "localhost"
+    port = int(port or os.environ.get("MQTT_PORT") or 1883)
+    in_topic = in_topic or os.environ.get("IN_MQTT_TOPIC") or "camera01/control"
+    out_topic = out_topic or os.environ.get("MQTT_TOPIC") or "camera01/result"
+    out_qos = int(out_qos or os.environ.get("OUT_MQTT_QOS") or os.environ.get("MQTT_QOS") or 1)
+
+    def _normalize_payload(data: bytes):
+        return find_base64_image(data)
+
+    def _on_message(client, userdata, message):
+        def _task():
+            try:
+                payload_result = _normalize_payload(message.payload)
+                logger.log(f"[MQTT DEBUG] find_base64_image result type: {type(payload_result)}", level="debug")
+                images = []
+                if isinstance(payload_result, dict) and "image" in payload_result:
+                    img_val = payload_result["image"]
+                    if isinstance(img_val, list):
+                        images = img_val
+                    else:
+                        images = [img_val]
+                else:
+                    images = [payload_result]
+
+                # optional ack
+                try:
+                    if send_ack:
+                        ack_t = ack_topic or f"{out_topic}_ack"
+                        publish_with_client(client, {"id": broker, "timestamp": datetime.now().isoformat()}, topic=ack_t, qos=out_qos)
+                except Exception:
+                    try:
+                        publish_mqtt({"error": "ack_failed"})
+                    except Exception:
+                        pass
+
+                responses = []
+                non_pass_responses = []
+                for idx, payload in enumerate(images, start=1):
+                    try:
+                        if isinstance(payload, (bytes, bytearray)):
+                            plen = len(payload)
+                            logger.log(f"[MQTT DEBUG] extracted payload type={type(payload)}, len={plen}", level="debug")
+                            if plen:
+                                logger.log(f"[MQTT DEBUG] payload head hex: {payload[:32].hex()}", level="debug")
+                        else:
+                            s = str(payload)
+                            logger.log(f"[MQTT DEBUG] extracted payload type={type(payload)}, repr head={s[:128]!r}", level="debug")
+                    except Exception as _e:
+                        logger.log(f"[MQTT DEBUG] payload debug failed: {_e}", level="debug")
+
+                    img_info = validate_image_format_cb(payload)
+                    if not img_info.get("valid"):
+                        img_info = {
+                            "valid": True,
+                            "format": "jpg",
+                            "extension": ".jpg",
+                            "mime_type": "image/jpeg",
+                            "size": len(payload) if isinstance(payload, (bytes, bytearray)) else 0,
+                            "width": 0,
+                            "height": 0,
+                        }
+
+                    base_name = f"mqtt_{message.topic.replace('/', '_')}"
+                    if len(images) > 1:
+                        filename = f"{base_name}_{idx}{img_info['extension']}"
+                    else:
+                        filename = f"{base_name}{img_info['extension']}"
+                    logger.log(f"✅ MQTT 이미지 수신: {filename} ({img_info.get('width',0)}x{img_info.get('height',0)}, {img_info.get('size',0)} bytes)", level="info")
+
+                    resp = process_image_cb(payload, filename, img_info.get("mime_type"))
+                    responses.append(resp)
+                    if resp.get("detection", {}).get("result") != "pass":
+                        non_pass_responses.append(resp)
+                    else:
+                        logger.log(f"Image {idx} detection result == 'pass' (no car); skip publish for this image unless another requires publish)", level="debug")
+
+                if len(non_pass_responses) == 0:
+                    logger.log("MQTT publish skipped: all images result == 'pass' (no car)", level="info")
+                else:
+                    aggregated = aggregate_fn(responses, include_images=True)
+                    try:
+                        publish_with_client(client, aggregated, topic=out_topic, qos=out_qos)
+                    except Exception:
+                        publish_mqtt(aggregated)
+            except Exception:
+                logger.log("Exception in mqtt on_message handler", level="error")
+
+        if executor is not None:
+            executor.submit(_task)
+        else:
+            _task()
+
+    paho_client = create_paho_client(
+        on_message_cb=_on_message,
+        broker=broker,
+        port=port,
+        use_tls=use_tls,
+        subscribe_topic=in_topic,
+        qos=out_qos,
+        start_loop=True,
+    )
+
+    return paho_client
+
+
 def is_client_connected(mqtt_client) -> bool:
     """Return True if the provided paho `mqtt_client` appears connected.
 
@@ -340,7 +594,7 @@ def is_client_connected(mqtt_client) -> bool:
 if __name__ == '__main__':
     # Basic demo: start Flask-MQTT for a few seconds to check callbacks.
     logging.basicConfig(level=logging.INFO)
-    print('Starting MQTT subscriber demo (will run ~5s)')
+    dlogger.log('Starting MQTT subscriber demo (will run ~5s)', level="info")
     mqtt_client = None
     try:
         try:
@@ -371,4 +625,4 @@ if __name__ == '__main__':
                         pass
         except Exception:
             pass
-    print('Demo finished')
+    dlogger.log('Demo finished', level="info")
