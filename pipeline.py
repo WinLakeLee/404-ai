@@ -136,7 +136,10 @@ class Pipeline:
                     self.class_conf_map[int(k.strip())] = float(v.strip())
                 self.logger.log(f"Loaded class_conf_map={self.class_conf_map}")
             except Exception as e:
-                self.logger.log(f"Failed to parse DETECTION_CONF_MAP='{conf_map_raw}': {e}", level="error")
+                self.logger.log(
+                    f"Failed to parse DETECTION_CONF_MAP='{conf_map_raw}': {e}",
+                    level="error",
+                )
         # NMS IoU 임계값 (클래스 무관). 0이면 NMS 비활성화
         self.nms_iou = float(os.getenv("DETECTION_NMS_IOU", 0.5))
 
@@ -148,8 +151,8 @@ class Pipeline:
             raise ValueError(f"이미지를 로드할 수 없습니다: {image_path}")
 
         # 1. YOLO 탐색
-        # If per-class thresholds exist and are lower than detector's configured conf,
-        # request the detector to run with the lower threshold so pipeline filtering can take effect.
+        # 클래스별 임계값이 존재하고 detector의 설정값보다 낮으면,
+        # detector를 더 낮은 임계값으로 실행하여 파이프라인의 필터링이 적용되도록 요청합니다.
         conf_override = None
         if self.class_conf_map:
             try:
@@ -174,11 +177,13 @@ class Pipeline:
                     if conf >= thr:
                         filtered.append(r)
                     else:
-                        self.logger.log(f"Filtered out cls={cls} conf={conf:.3f} < thr={thr}")
+                        self.logger.log(
+                            f"Filtered out cls={cls} conf={conf:.3f} < thr={thr}"
+                        )
             regions = filtered
         self.logger.log(f"Detected regions (post-filter): {len(regions)}")
 
-        # Apply class-agnostic NMS to prevent overlapping boxes
+        # 클래스 무관 NMS 적용: 겹치는 박스 제거를 위해 적용합니다
         if regions and self.nms_iou and float(self.nms_iou) > 0.0:
             boxes = [r.get("bbox") for r in regions]
             scores = [float(r.get("conf") or 0.0) for r in regions]
@@ -189,7 +194,7 @@ class Pipeline:
                 keep.append(cur)
                 rem = []
                 for i in idxs:
-                    # compute IoU
+                    # IoU(교집합비율) 계산
                     xA = max(boxes[cur][0], boxes[i][0])
                     yA = max(boxes[cur][1], boxes[i][1])
                     xB = min(boxes[cur][2], boxes[i][2])
@@ -197,8 +202,12 @@ class Pipeline:
                     interW = max(0, xB - xA)
                     interH = max(0, yB - yA)
                     interArea = interW * interH
-                    areaA = max(0, boxes[cur][2] - boxes[cur][0]) * max(0, boxes[cur][3] - boxes[cur][1])
-                    areaB = max(0, boxes[i][2] - boxes[i][0]) * max(0, boxes[i][3] - boxes[i][1])
+                    areaA = max(0, boxes[cur][2] - boxes[cur][0]) * max(
+                        0, boxes[cur][3] - boxes[cur][1]
+                    )
+                    areaB = max(0, boxes[i][2] - boxes[i][0]) * max(
+                        0, boxes[i][3] - boxes[i][1]
+                    )
                     denom = float(areaA + areaB - interArea)
                     iou_val = interArea / denom if denom > 0 else 0.0
                     if iou_val <= float(self.nms_iou):
@@ -208,22 +217,35 @@ class Pipeline:
             self.logger.log(f"Detected regions (after NMS): {len(regions)}")
 
         # 2. 차량 존재 여부 판단: select_toy_car_class에 위임
-        toy_car_class, present_cls = self.select_toy_car_class(regions, image_shape=image.shape[:2])
+        toy_car_class, present_cls = self.select_toy_car_class(
+            regions, image_shape=image.shape[:2]
+        )
         toy_car_exists = toy_car_class is not None
         # SHOW_IGNORED_CLASSES 환경변수가 true이면 cls 3,4를 임시로 legend와 bbox에 표시
-        show_ignored = os.getenv("SHOW_IGNORED_CLASSES", "true").lower() in ("1", "true", "yes")
+        show_ignored = os.getenv("SHOW_IGNORED_CLASSES", "true").lower() in (
+            "1",
+            "true",
+            "yes",
+        )
 
         class_colors = {
-            0: (0, 255, 0),  # green
-            1: (0, 0, 255),  # red
-            2: (255, 0, 0),  # blue
-            3: (0, 255, 255),  # yellow
-            4: (255, 0, 255),  # magenta
-            5: (255, 255, 0),  # cyan
-            6: (128, 128, 128),  # gray
+            0: (0, 255, 0),  # 초록
+            1: (0, 0, 255),  # 빨강
+            2: (255, 0, 0),  # 파랑
+            3: (0, 255, 255),  # 노랑
+            4: (255, 0, 255),  # 마젠타
+            5: (255, 255, 0),  # 시안
+            6: (128, 128, 128),  # 회색
         }
         # 클래스 이름 매핑: 1->toy_car, 4->case, 3->car_floor, 2->broken, 5->scratch, 6->separated
-        class_names = {1: "toy_car", 4: "case", 3: "car_floor", 2: "broken", 5: "scratch", 6: "separated"}
+        class_names = {
+            1: "toy_car",
+            4: "case",
+            3: "car_floor",
+            2: "broken",
+            5: "scratch",
+            6: "separated",
+        }
 
         # pipeline은 이제 감지 결과(클래스, bbox, conf)만 반환합니다.
         # 애플리케이션 레이어에서 이미지 수준 판정이나 anomaly 실행을 담당합니다.
@@ -236,7 +258,9 @@ class Pipeline:
                 "conf": reg.get("conf"),
                 "class_id": cls_id,
             }
-            self.logger.log(f"[{i}] cls={cls_id} (detected, anomaly skipped in pipeline)")
+            self.logger.log(
+                f"[{i}] cls={cls_id} (detected, anomaly skipped in pipeline)"
+            )
             results.append(out)
 
             # bbox 그리기 규칙:
@@ -244,8 +268,8 @@ class Pipeline:
             # - cls 1(toy_car)와 cls 4(case)는 표시 (단, toy_car가 감지된 경우 floor/case는 무시)
             # - cls 3(car_floor)는 cls 4가 없을 때만 표시
             # - cls 2는 기본적으로 무시(표시하려면 SHOW_IGNORED_CLASSES)
-            draw_cls3 = (cls_id == 3 and 4 not in {r.get("class_id") for r in regions})
-            # if toy_car exists, ignore floor(3) and case(4) for drawing
+            draw_cls3 = cls_id == 3 and 4 not in {r.get("class_id") for r in regions}
+            # toy_car가 존재하면 drawing에서는 floor(3)와 case(4)를 무시합니다
             if toy_car_exists and cls_id in (3, 4):
                 continue
             if (
@@ -262,7 +286,9 @@ class Pipeline:
         h, w = image.shape[:2]
         legend_w = int(w * 0.3)
         # legend에 표시할 클래스: 이미지에서 감지된 모든 클래스 ID를 표시
-        legend_cls_ids = {reg.get("class_id") for reg in regions if reg.get("class_id") is not None}
+        legend_cls_ids = {
+            reg.get("class_id") for reg in regions if reg.get("class_id") is not None
+        }
         # 사용자 규칙: 기본적으로 class 3(car_floor)은 legend에서 제외
         # SHOW_IGNORED_CLASSES가 true이면 포함시켜 임시 표시
         if not show_ignored:
@@ -295,7 +321,7 @@ class Pipeline:
         color_box_w = max(int(line_height * 0.7), 12)
         color_box_h = max(int(line_height * 0.7), 12)
         for cid in legend_cls_ids:
-            # If class 4 exists alone (no class 1), show it as 'toy_car'
+            # 클래스 4만 있고 클래스 1이 없으면 'toy_car'로 표기합니다
             if cid == 4 and 1 not in present_cls:
                 cname = "toy_car"
             elif cid == 1:
@@ -336,13 +362,20 @@ class Pipeline:
         self.logger.save_result({"image": str(image_path), "results": results})
         return results
 
-    def select_toy_car_class(self, regions: List[Dict], image_shape: Optional[tuple] = None, image_path: Optional[Path] = None):
+    def select_toy_car_class(
+        self,
+        regions: List[Dict],
+        image_shape: Optional[tuple] = None,
+        image_path: Optional[Path] = None,
+    ):
         """주어진 감지 결과에서 toy_car_class 우선순위(1,4,3,6)를 적용하여 선택합니다.
         선택 시 환경변수 `TOY_CAR_MIN_AREA_RATIO`가 설정되어 있으면 클래스 3 또는 6에 대해
         해당 비율 이상인 박스가 존재해야 선택합니다.
         반환: (toy_car_class or None, present_cls set)
         """
-        present_cls = {r.get("class_id") for r in regions if r.get("class_id") is not None}
+        present_cls = {
+            r.get("class_id") for r in regions if r.get("class_id") is not None
+        }
         # 기본 우선순위
         toy_car_class = None
         if 1 in present_cls:
@@ -352,7 +385,7 @@ class Pipeline:
         elif 3 in present_cls or 6 in present_cls:
             # 3 또는 6은 이미지 내에서 충분히 큰 박스가 있을 때만 차량으로 간주할 수 있음
             if self.toycar_min_area_ratio and (3 in present_cls or 6 in present_cls):
-                # determine image area
+                # 이미지 면적 계산
                 ih, iw = None, None
                 if image_shape:
                     ih, iw = image_shape[0], image_shape[1]
@@ -362,7 +395,7 @@ class Pipeline:
                         ih, iw = img.shape[:2]
                 if ih and iw:
                     img_area = ih * iw
-                    # find max area among cls 3 or 6
+                    # 클래스 3 또는 6 중 최대 박스 면적을 찾음
                     max_area = 0
                     max_cls = None
                     for r in regions:
@@ -381,16 +414,20 @@ class Pipeline:
                     # 이미지 크기를 알 수 없으면 보수적으로 선택하지 않음
                     toy_car_class = None
             else:
-                # no area restriction -> choose 3 if present else 6
+                # 면적 제한이 없으면 3이 있으면 3, 아니면 6을 선택
                 if 3 in present_cls:
                     toy_car_class = 3
                 elif 6 in present_cls:
                     toy_car_class = 6
         # else toy_car_class remains None
-        self.logger.log(f"[SELECT] present_cls={present_cls} -> toy_car_class={toy_car_class}")
+        self.logger.log(
+            f"[SELECT] present_cls={present_cls} -> toy_car_class={toy_car_class}"
+        )
         return toy_car_class, present_cls
 
-    def predict_anomalies_for(self, image_path: Path, regions: List[Dict], targets: Optional[set] = None):
+    def predict_anomalies_for(
+        self, image_path: Path, regions: List[Dict], targets: Optional[set] = None
+    ):
         """주어진 regions에 대해 anomaly backend를 실행하여 'anomaly' 필드를 추가한 결과를 반환합니다.
         targets: 클래스 ID 집합만 처리 (None이면 모든 클래스 처리)
         """
@@ -402,11 +439,17 @@ class Pipeline:
             out = dict(r)
             cls_id = out.get("class_id")
             if targets is None or cls_id in targets:
-                if self.anomaly and (self.anomaly_backend in ("patchcore", "efficientad")):
-                    anomaly = self.anomaly.predict_crop(image, out["bbox"], threshold=self.anomaly_threshold)
+                if self.anomaly and (
+                    self.anomaly_backend in ("patchcore", "efficientad")
+                ):
+                    anomaly = self.anomaly.predict_crop(
+                        image, out["bbox"], threshold=self.anomaly_threshold
+                    )
                     out["anomaly"] = anomaly
                     tag = "DEFECT" if anomaly.get("is_anomaly") else "OK"
-                    self.logger.log(f"[anomaly] idx={i} cls={cls_id} score={anomaly.get('score'):.2f} -> {tag}")
+                    self.logger.log(
+                        f"[anomaly] idx={i} cls={cls_id} score={anomaly.get('score'):.2f} -> {tag}"
+                    )
                 else:
                     out["anomaly"] = None
             else:
@@ -464,4 +507,3 @@ def main():
     )
 
     args = parser.parse_args()
-

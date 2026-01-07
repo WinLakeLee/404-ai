@@ -5,7 +5,13 @@ from ultralytics import YOLO
 
 
 class YOLODetector:
-    def __init__(self, model_path: str, device: str = "cuda", conf: float = 0.25, imgsz: int = 640):
+    def __init__(
+        self,
+        model_path: str,
+        device: str = "cuda",
+        conf: float = 0.25,
+        imgsz: int = 640,
+    ):
         self.model_path = model_path
         self.device = device
         self.conf = conf
@@ -13,8 +19,7 @@ class YOLODetector:
         self.model = YOLO(model_path)
 
     def detect(self, image_path, conf_override: float = None) -> List[Dict]:
-        """Detect boxes. If `conf_override` is provided, use it as the model confidence threshold.
-        """
+        """바운딩 박스를 탐지합니다. `conf_override`가 주어지면 모델 신뢰도 임계값으로 사용합니다."""
         conf_to_use = float(conf_override) if conf_override is not None else self.conf
         results = self.model.predict(
             source=str(image_path),
@@ -32,9 +37,11 @@ class YOLODetector:
                     x1, y1, x2, y2 = map(int, box.xyxy[0].cpu().numpy())
                     conf = float(box.conf[0])
                     cls_id = int(box.cls[0])
-                    regions.append({
-                        "bbox": [x1, y1, x2, y2],
-                        "conf": conf,
-                        "class_id": cls_id,
-                    })
+                    regions.append(
+                        {
+                            "bbox": [x1, y1, x2, y2],
+                            "conf": conf,
+                            "class_id": cls_id,
+                        }
+                    )
         return regions

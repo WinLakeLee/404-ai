@@ -1,6 +1,6 @@
 """
-404-AI orchestrator (Flask): proxies image uploads to vision  services.
-Inference service: app.py (YOLO + PatchCore)
+404-AI 오케스트레이터(Flask): 이미지 업로드를 비전 서비스로 전달합니다.
+추론 서비스 엔트리포인트: app.py (YOLO + PatchCore)
 """
 
 import os
@@ -64,11 +64,19 @@ _OUT_QOS = int(os.environ.get("OUT_MQTT_QOS") or os.environ.get("MQTT_QOS") or 1
 
 # ACK behavior: don't publish ACKs to the main result topic by default.
 # Set `MQTT_SEND_ACK=1` to enable ACKs, and `MQTT_ACK_TOPIC` to change the ack topic.
-_MQTT_SEND_ACK = (os.environ.get("MQTT_SEND_ACK") or "0").lower() in ("1", "true", "yes")
+_MQTT_SEND_ACK = (os.environ.get("MQTT_SEND_ACK") or "0").lower() in (
+    "1",
+    "true",
+    "yes",
+)
 _MQTT_ACK_TOPIC = os.environ.get("MQTT_ACK_TOPIC") or None
 
 # Whether to force `data:image/jpeg;base64,` prefix on published result_image
-_FORCE_DATA_URI_PREFIX = (os.environ.get("FORCE_DATA_URI_HEADER") or "1").lower() in ("1", "true", "yes")
+_FORCE_DATA_URI_PREFIX = (os.environ.get("FORCE_DATA_URI_HEADER") or "1").lower() in (
+    "1",
+    "true",
+    "yes",
+)
 
 app.config["MQTT_BROKER_URL"] = _MQTT_BROKER
 app.config["MQTT_BROKER_PORT"] = _MQTT_PORT
@@ -81,7 +89,7 @@ app.config["MQTT_CLEAN_SESSION"] = True
 _MQTT_CLIENT = None
 
 
-# Start a background monitor that periodically prints MQTT connection info.
+# MQTT 연결 상태를 주기적으로 출력하는 백그라운드 모니터를 시작합니다.
 def _start_mqtt_monitor(interval: int = 10):
     def _monitor():
         prev_connected = None
@@ -102,7 +110,10 @@ def _start_mqtt_monitor(interval: int = 10):
                     )
                 prev_connected = connected
             except Exception:
-                dlogger.log(f"[{datetime.now().isoformat()}] MQTT status: check failed", level="warning")
+                dlogger.log(
+                    f"[{datetime.now().isoformat()}] MQTT status: check failed",
+                    level="warning",
+                )
             time.sleep(interval)
 
     t = threading.Thread(target=_monitor, daemon=True)
@@ -182,20 +193,44 @@ def validate_image_format(data: bytes) -> dict:
             max_w, max_h, min_w, min_h = 10000, 10000, 1, 1
 
         if width <= 0 or height <= 0:
-            return {"valid": False, "size": len(data), "error": "이미지 치수가 유효하지 않습니다"}
+            return {
+                "valid": False,
+                "size": len(data),
+                "error": "이미지 치수가 유효하지 않습니다",
+            }
 
         if width < min_w or height < min_h:
-            return {"valid": False, "size": len(data), "error": f"이미지 치수가 너무 작습니다 ({width}x{height})"}
+            return {
+                "valid": False,
+                "size": len(data),
+                "error": f"이미지 치수가 너무 작습니다 ({width}x{height})",
+            }
 
         if width > max_w or height > max_h:
-            return {"valid": False, "size": len(data), "error": f"이미지 치수가 너무 큽니다 ({width}x{height})"}
+            return {
+                "valid": False,
+                "size": len(data),
+                "error": f"이미지 치수가 너무 큽니다 ({width}x{height})",
+            }
 
         # 간단한 서명 스캔: 헤더/앞부분에서 스크립트/실행 파일/압축 아카이브 흔적 검출
         head = data[:4096].lower()
-        suspicious_signatures = [b"<?php", b"<script", b"javascript:", b"pk\x03\x04", b"mz", b"#!/bin/sh", b"<!doctype html"]
+        suspicious_signatures = [
+            b"<?php",
+            b"<script",
+            b"javascript:",
+            b"pk\x03\x04",
+            b"mz",
+            b"#!/bin/sh",
+            b"<!doctype html",
+        ]
         for sig in suspicious_signatures:
             if sig in head:
-                return {"valid": False, "size": len(data), "error": f"의심 서명 발견: {sig.decode('latin1', 'ignore')}"}
+                return {
+                    "valid": False,
+                    "size": len(data),
+                    "error": f"의심 서명 발견: {sig.decode('latin1', 'ignore')}",
+                }
 
         return {
             "valid": True,
@@ -207,19 +242,27 @@ def validate_image_format(data: bytes) -> dict:
             "height": height,
         }
     except Image.DecompressionBombError as e:
-        return {"valid": False, "size": len(data), "error": f"이미지 디컴프레스 폭탄 의심: {str(e)}"}
+        return {
+            "valid": False,
+            "size": len(data),
+            "error": f"이미지 디컴프레스 폭탄 의심: {str(e)}",
+        }
     except Exception as e:
-        return {"valid": False, "size": len(data), "format": fmt, "error": f"이미지 검증 실패: {str(e)}"}
+        return {
+            "valid": False,
+            "size": len(data),
+            "format": fmt,
+            "error": f"이미지 검증 실패: {str(e)}",
+        }
 
 
 def aggregate_batch_response(responses: list, include_images: bool = False) -> dict:
     """
-    Given a list of per-image response dicts (as returned by `process_image`),
-    compute the aggregated top-level response structure used by HTTP `/detect`
-    and MQTT publications.
+    각 이미지별 응답(dict 리스트, `process_image` 반환)을 받아
+    HTTP `/detect` 및 MQTT 발행에 사용되는 최상위 집계 응답 구조를 생성합니다.
 
-    Returns a dict with keys: result, scratch_count, broken_count,
-    separated_count, result_image (list), car_regions (list), reason, timestamp
+    반환 dict의 주요 키: result, scratch_count, broken_count,
+    separated_count, result_image(리스트), car_regions(리스트), reason, timestamp
     """
     total_scratch_count = 0
     total_broken_count = 0
@@ -295,11 +338,11 @@ def aggregate_batch_response(responses: list, include_images: bool = False) -> d
                     v = det.get(k)
                     if k == "result_image":
                         if v:
-                                if not isinstance(v, str):
-                                    v = str(v)
-                                if _FORCE_DATA_URI_PREFIX:
-                                    if not v.startswith("data:image/jpeg;base64,"):
-                                        v = f"data:image/jpeg;base64,{v.lstrip()}"
+                            if not isinstance(v, str):
+                                v = str(v)
+                            if _FORCE_DATA_URI_PREFIX:
+                                if not v.startswith("data:image/jpeg;base64,"):
+                                    v = f"data:image/jpeg;base64,{v.lstrip()}"
                         else:
                             v = ""
                     new_det[k] = v
@@ -353,7 +396,11 @@ def index():
 @app.route("/health")
 def health():
     deps = {}
-    for pkg, name in (("flask", "flask"), ("cv2", "opencv"), ("ultralytics", "ultralytics")):
+    for pkg, name in (
+        ("flask", "flask"),
+        ("cv2", "opencv"),
+        ("ultralytics", "ultralytics"),
+    ):
         try:
             __import__(pkg)
             deps[name] = "installed"
@@ -380,7 +427,10 @@ def health():
         if det is not None:
             detector_info["class"] = det.__class__.__name__
             detector_info["model_path"] = getattr(det, "model_path", None)
-            detector_info["model_exists"] = bool(detector_info.get("model_path") and os.path.exists(str(detector_info.get("model_path"))))
+            detector_info["model_exists"] = bool(
+                detector_info.get("model_path")
+                and os.path.exists(str(detector_info.get("model_path")))
+            )
             detector_info["conf"] = getattr(det, "conf", None)
 
         an = getattr(_SCRATCH_PIPELINE, "anomaly", None)
@@ -391,7 +441,15 @@ def health():
         else:
             anomaly_info["ready"] = False
 
-    status_overall = "healthy" if (all(v == "installed" for v in deps.values()) and pipeline_ok and mqtt_connected) else "degraded"
+    status_overall = (
+        "healthy"
+        if (
+            all(v == "installed" for v in deps.values())
+            and pipeline_ok
+            and mqtt_connected
+        )
+        else "degraded"
+    )
 
     payload = {
         "status": status_overall,
@@ -399,7 +457,11 @@ def health():
         "uptime_sec": uptime_sec,
         "disk_free_bytes": disk.free,
         "dependencies": deps,
-        "mqtt": {"connected": mqtt_connected, "broker": _MQTT_BROKER, "port": _MQTT_PORT},
+        "mqtt": {
+            "connected": mqtt_connected,
+            "broker": _MQTT_BROKER,
+            "port": _MQTT_PORT,
+        },
         "pipeline": {
             "initialized": pipeline_ok,
             "detector": detector_info,
@@ -455,7 +517,9 @@ def process_image(
             with _UPLOAD_COUNTER_LOCK:
                 idx = next(_UPLOAD_COUNTER)
             base_name = os.path.splitext(filename)[0]
-            debug_img_path = os.path.join(debug_dir, f"{idx:04d}_{base_name}{img_info['extension']}")
+            debug_img_path = os.path.join(
+                debug_dir, f"{idx:04d}_{base_name}{img_info['extension']}"
+            )
             # 감지 수행
             from pathlib import Path
 
@@ -474,33 +538,55 @@ def process_image(
             # 결과 집계
             car_regions = results if isinstance(results, list) else []
             # pipeline에 위임된 선별 로직 사용: toy_car_class 선택 (이미지 경로 제공)
-            toy_car_class, present_cls = _SCRATCH_PIPELINE.select_toy_car_class(car_regions, image_path=Path(tmp_path))
+            toy_car_class, present_cls = _SCRATCH_PIPELINE.select_toy_car_class(
+                car_regions, image_path=Path(tmp_path)
+            )
             toy_car_exists = toy_car_class is not None
-            dlogger.log(f"[DEBUG] present_cls={present_cls} -> toy_car_class={toy_car_class}", level="debug")
+            dlogger.log(
+                f"[DEBUG] present_cls={present_cls} -> toy_car_class={toy_car_class}",
+                level="debug",
+            )
             if not toy_car_exists:
                 scratch_result = {
                     "success": False,
-                    "result_image": (f"data:image/jpeg;base64,{img_base64}" if _FORCE_DATA_URI_PREFIX else img_base64),
+                    "result_image": (
+                        f"data:image/jpeg;base64,{img_base64}"
+                        if _FORCE_DATA_URI_PREFIX
+                        else img_base64
+                    ),
                     "car_regions": car_regions,
                     "result": "pass",
                     "reason": f"no car (cls in {sorted(list(present_cls))} -> none of 1,4,3,6)",
                 }
-                dlogger.log("[DEBUG] pipeline summary: no car (cls=1,3,4,6) detected, pass", level="debug")
+                dlogger.log(
+                    "[DEBUG] pipeline summary: no car (cls=1,3,4,6) detected, pass",
+                    level="debug",
+                )
             else:
                 # 선택된 toy_car_class에 대해서만 anomaly 실행
-                augmented = _SCRATCH_PIPELINE.predict_anomalies_for(Path(tmp_path), car_regions, targets={toy_car_class})
+                augmented = _SCRATCH_PIPELINE.predict_anomalies_for(
+                    Path(tmp_path), car_regions, targets={toy_car_class}
+                )
                 # 집계: scratch(5), broken(placeholder), separated(6)
                 scratch_count = sum(1 for r in augmented if r.get("class_id") == 5)
                 broken_count = 0
                 separated_count = sum(1 for r in augmented if r.get("class_id") == 6)
                 # anomaly_detected는 선택된 toy_car_class 영역에서의 이상 유무
                 anomaly_detected = any(
-                    (r.get("class_id") == toy_car_class and r.get("anomaly") and r["anomaly"].get("is_anomaly"))
+                    (
+                        r.get("class_id") == toy_car_class
+                        and r.get("anomaly")
+                        and r["anomaly"].get("is_anomaly")
+                    )
                     for r in augmented
                 )
                 scratch_result = {
                     "success": True,
-                    "result_image": (f"data:image/jpeg;base64,{img_base64}" if _FORCE_DATA_URI_PREFIX else img_base64),
+                    "result_image": (
+                        f"data:image/jpeg;base64,{img_base64}"
+                        if _FORCE_DATA_URI_PREFIX
+                        else img_base64
+                    ),
                     "scratch_detected": bool(scratch_count),
                     "broken_detected": bool(broken_count),
                     "separated_detected": bool(separated_count),
@@ -511,7 +597,10 @@ def process_image(
                     "car_regions": augmented,
                     "result": ("defect" if anomaly_detected else "ok"),
                 }
-                dlogger.log(f"[DEBUG] pipeline summary: toy_car_class={toy_car_class} anomaly_detected={anomaly_detected}", level="debug")
+                dlogger.log(
+                    f"[DEBUG] pipeline summary: toy_car_class={toy_car_class} anomaly_detected={anomaly_detected}",
+                    level="debug",
+                )
             try:
                 os.unlink(tmp_path)
             except Exception:
@@ -555,11 +644,15 @@ def detect():
     images = []
     if request.is_json:
         req_json = request.get_json()
-        dlogger.log(f"[DEBUG] /detect JSON payload: {json.dumps(req_json, ensure_ascii=False)}", level="debug")
+        dlogger.log(
+            f"[DEBUG] /detect JSON payload: {json.dumps(req_json, ensure_ascii=False)}",
+            level="debug",
+        )
         images = req_json.get("images", [])
         # images가 없으면 에러
         if not images:
             return jsonify({"error": "no images in JSON payload"}), 400
+
         def get_image_bytes(imgobj):
             b64 = imgobj.get("image", "")
             if b64.startswith("data:") and "base64," in b64:
@@ -568,10 +661,18 @@ def detect():
                 return base64.b64decode(b64)
             except Exception:
                 return b""
-        image_datas = [(get_image_bytes(img), f"json_image_{i}.png") for i, img in enumerate(images)]
+
+        image_datas = [
+            (get_image_bytes(img), f"json_image_{i}.png")
+            for i, img in enumerate(images)
+        ]
     elif "image" in request.files:
         files = request.files.getlist("image")
-        image_datas = [(file.read(), file.filename or datetime.now().isoformat()) for file in files if file.filename != ""]
+        image_datas = [
+            (file.read(), file.filename or datetime.now().isoformat())
+            for file in files
+            if file.filename != ""
+        ]
         if not image_datas:
             return jsonify({"error": "no image file provided"}), 400
     else:
@@ -622,21 +723,27 @@ def detect():
     # only when NOT all images are 'pass'. For single-image input, publish single
     # response object unless it is 'pass'.
     if len(non_pass_responses) == 0:
-        dlogger.log("HTTP /detect: publish skipped — all images result == 'pass'", level="info")
+        dlogger.log(
+            "HTTP /detect: publish skipped — all images result == 'pass'", level="info"
+        )
     else:
-            try:
-                # build a publish payload that includes per-image details
-                publish_payload = aggregate_batch_response(responses, include_images=True)
+        try:
+            # build a publish payload that includes per-image details
+            publish_payload = aggregate_batch_response(responses, include_images=True)
 
-                if _MQTT_CLIENT is not None:
-                    publish_with_client(_MQTT_CLIENT, publish_payload, topic=_OUT_TOPIC, qos=_OUT_QOS)
-                else:
-                    publish_mqtt(publish_payload)
+            if _MQTT_CLIENT is not None:
+                publish_with_client(
+                    _MQTT_CLIENT, publish_payload, topic=_OUT_TOPIC, qos=_OUT_QOS
+                )
+            else:
+                publish_mqtt(publish_payload)
+        except Exception:
+            try:
+                publish_mqtt(publish_payload)
             except Exception:
-                try:
-                    publish_mqtt(publish_payload)
-                except Exception:
-                    dlogger.log("Failed to publish HTTP-detect batched result", level="error")
+                dlogger.log(
+                    "Failed to publish HTTP-detect batched result", level="error"
+                )
     # 최종 응답 dict 구성: MQTT에 발행한 것과 동일한 구조로 반환
     # (per-image 상세 포함 여부는 include_images=True로 통일)
     aggregated = aggregate_batch_response(responses, include_images=True)

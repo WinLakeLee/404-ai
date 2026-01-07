@@ -36,7 +36,12 @@ except Exception:
 
 
 class PatchCoreOptimized:
-    def __init__(self, backbone_name: str = "wide_resnet50_2", sampling_ratio: float = 0.01, use_fp16: bool = True):
+    def __init__(
+        self,
+        backbone_name: str = "wide_resnet50_2",
+        sampling_ratio: float = 0.01,
+        use_fp16: bool = True,
+    ):
         self.sampling_ratio = sampling_ratio
         self.use_fp16 = use_fp16 and torch.cuda.is_available()
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -109,7 +114,9 @@ class PatchCoreOptimized:
         with torch.no_grad():
             self.backbone(x)
         f2, f3 = self.features[0], self.features[1]
-        f3_resized = F.interpolate(f3, size=f2.shape[-2:], mode="bilinear", align_corners=True)
+        f3_resized = F.interpolate(
+            f3, size=f2.shape[-2:], mode="bilinear", align_corners=True
+        )
         concat = torch.cat([f2, f3_resized], dim=1)
         pooled = F.avg_pool2d(concat, kernel_size=3, stride=1, padding=1)
         pooled = pooled.permute(0, 2, 3, 1)
@@ -137,12 +144,21 @@ class PatchCoreOptimized:
         else:
             raise RuntimeError("No index available")
         patch_scores = dists.mean(axis=1).reshape(batch_size, patches_per_image)
-        img_scores = patch_scores.mean(axis=1) if score_type == "mean" else patch_scores.max(axis=1)
+        img_scores = (
+            patch_scores.mean(axis=1)
+            if score_type == "mean"
+            else patch_scores.max(axis=1)
+        )
         return torch.from_numpy(img_scores)
 
 
 class PatchCoreBackend:
-    def __init__(self, checkpoint_dir: str, device: str = "cuda", anomaly_threshold: float = 33.08):
+    def __init__(
+        self,
+        checkpoint_dir: str,
+        device: str = "cuda",
+        anomaly_threshold: float = 33.08,
+    ):
         self.device = torch.device(device if torch.cuda.is_available() else "cpu")
         self.anomaly_threshold = anomaly_threshold
 
@@ -174,7 +190,9 @@ class PatchCoreBackend:
                 transforms.Resize(256),
                 transforms.CenterCrop(224),
                 transforms.ToTensor(),
-                transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+                transforms.Normalize(
+                    mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
+                ),
             ]
         )
 
@@ -195,5 +213,5 @@ class PatchCoreBackend:
         }
 
 
-# OpenCV import placed at bottom to avoid circular deps in some environments
+# 일부 환경에서 순환 의존 문제를 피하기 위해 OpenCV 임포트는 파일 하단에 위치시킵니다
 import cv2  # noqa: E402  # isort:skip

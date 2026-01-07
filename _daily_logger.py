@@ -2,22 +2,25 @@ import logging
 import os
 from datetime import datetime
 
+
 class DailyLogger:
     def __init__(self, log_dir="logs", log_prefix="result"):
         self.log_dir = log_dir
         os.makedirs(self.log_dir, exist_ok=True)
         self.log_prefix = log_prefix
-        # maps level -> (date_str, logger)
+        # 레벨별 매핑: (date_str, logger)
         self.loggers = {}
-        # Do not create handlers until first log (ensures date folder correctness)
-        # retention in days: default 30, override with env LOG_RETENTION_DAYS
+        # 핸들러는 첫 로그 시점까지 생성하지 않음 (날짜별 폴더 정확성 보장)
+        # 로그 보존일수: 기본 30일, 환경변수 LOG_RETENTION_DAYS로 재정의
         try:
             self.retention_days = int(os.environ.get("LOG_RETENTION_DAYS", "30"))
         except Exception:
             self.retention_days = 30
-        # archive retention in months: default 6, override with env LOG_ARCHIVE_RETENTION_MONTHS
+        # 아카이브 보존 개월수: 기본 6개월, 환경변수 LOG_ARCHIVE_RETENTION_MONTHS로 재정의
         try:
-            self.archive_retention_months = int(os.environ.get("LOG_ARCHIVE_RETENTION_MONTHS", "6"))
+            self.archive_retention_months = int(
+                os.environ.get("LOG_ARCHIVE_RETENTION_MONTHS", "6")
+            )
         except Exception:
             self.archive_retention_months = 6
 
@@ -32,17 +35,18 @@ class DailyLogger:
             pass
         return d
 
-    def _prune_old_dirs(self):
-        """Archive folders older than retention_days, and prune old archives.
+        def _prune_old_dirs(self):
+            """보존일보다 오래된 날짜 폴더를 아카이브하고 오래된 아카이브를 정리합니다.
 
-        Behavior:
-        - For date-named folders older than `self.retention_days`, create a
-          compressed tar.gz under `logs/archived/` named `<YYYY-MM-DD>.tar.gz`
-          (skip if archive already exists), then remove the original folder.
-        - Remove archives older than `archive_retention_months`.
-        """
+            동작:
+            - `self.retention_days`보다 오래된 날짜 형식 폴더는 `logs/archived/`에
+                `<YYYY-MM-DD>.tar.gz` 형태로 압축하여 저장(이미 존재하면 건너뜀)한 뒤 원본 폴더를 삭제합니다.
+            - `archive_retention_months`보다 오래된 아카이브 파일은 삭제합니다.
+            """
+
         import shutil
         import tarfile
+
         now = datetime.now()
 
         # ensure archive dir exists
@@ -84,7 +88,7 @@ class DailyLogger:
         # 2) Prune old archives (by months)
         try:
             for fname in os.listdir(archive_root):
-                if not fname.endswith('.tar.gz'):
+                if not fname.endswith(".tar.gz"):
                     continue
                 fpath = os.path.join(archive_root, fname)
                 # try parse date from filename <YYYY-MM-DD>.tar.gz
@@ -110,8 +114,8 @@ class DailyLogger:
 
     def _setup_logger(self, level: str = "info"):
         """
-        Prepare (or retrieve) a logger for specific level writing into
-        a date-based folder and a level-specific file.
+        특정 레벨용 로거를 준비(또는 반환)합니다. 로그는 날짜별 폴더와
+        레벨별 파일에 기록됩니다.
         """
         level = (level or "info").lower()
         today = datetime.now().strftime("%Y-%m-%d")
@@ -143,7 +147,7 @@ class DailyLogger:
         # Add new file handler for today's log
         fh = logging.FileHandler(log_path, encoding="utf-8")
         fh.setLevel(logging.DEBUG)
-        formatter = logging.Formatter('%(asctime)s %(levelname)s: %(message)s')
+        formatter = logging.Formatter("%(asctime)s %(levelname)s: %(message)s")
         fh.setFormatter(formatter)
         logger.addHandler(fh)
 
@@ -152,7 +156,7 @@ class DailyLogger:
         return logger
 
     def log(self, msg, level="info"):
-        # Ensure logger for requested level exists (handles date rollover)
+        # 요청된 레벨용 로거가 존재하는지 확인(날짜 변경 처리)
         lvl = (level or "info").lower()
         logger = self._setup_logger(lvl)
         if lvl == "info":
@@ -166,15 +170,17 @@ class DailyLogger:
 
     def save_result(self, result):
         """
-        result(dict 또는 str)을 로그 파일에 저장
+        result(dict 또는 str)을 로그 파일에 저장합니다.
         """
         import json
+
         # Save results to info-level log for the current date
         logger = self._setup_logger("info")
         if isinstance(result, dict):
             logger.info("RESULT: " + json.dumps(result, ensure_ascii=False))
         else:
             logger.info(f"RESULT: {result}")
+
 
 # 사용 예시:
 # from _daily_logger import DailyLogger

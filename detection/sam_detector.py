@@ -15,22 +15,25 @@ class SAMDetector:
         imgsz: int = 640,
     ):
         self.model_path = model_path
-        # allow overriding prompt via env var for quick tuning
+        # 빠른 튜닝을 위해 환경변수로 프롬프트를 재정의할 수 있음
         self.prompt = os.getenv("SAM_PROMPT", prompt)
         self.device = device
         self.conf = float(os.getenv("SAM_MIN_CONF", conf))
         self.imgsz = imgsz
-        # minimum area ratio (bbox area / image area) to keep detection
+        # 유지할 탐지의 최소 면적 비율(bbox면적 / 이미지면적)
         self.min_area_ratio = float(os.getenv("SAM_MIN_AREA_RATIO", 0.002))
-        # aspect ratio filter (w/h) to exclude extreme shapes
+        # 종횡비 필터(w/h): 지나치게 얇거나 퍼진 형태를 제외
         self.min_aspect = float(os.getenv("SAM_MIN_ASPECT", 0.3))
         self.max_aspect = float(os.getenv("SAM_MAX_ASPECT", 3.0))
         self.model = FastSAM(model_path)
-    def detect(self, image_path, return_image: bool = False, **kwargs) -> Union[List[Dict], Tuple[List[Dict], "cv2.Mat"]]:
-        """Run FastSAM and return detections (and optionally an annotated BGR image).
 
-        return_image=True gives you a copy of the original image with only boxes drawn,
-        so colors stay unchanged instead of using FastSAM's RGB render output.
+    def detect(
+        self, image_path, return_image: bool = False, **kwargs
+    ) -> Union[List[Dict], Tuple[List[Dict], "cv2.Mat"]]:
+        """FastSAM을 실행하여 감지 결과를 반환합니다. 선택적으로 주석이 그려진 BGR 이미지를 함께 반환할 수 있습니다.
+
+        `return_image=True`이면 원본 이미지의 복사본에 박스만 그려 반환하므로
+        FastSAM의 RGB 렌더 출력 대신 색상이 유지됩니다.
         """
         image = cv2.imread(str(image_path))
         if image is None:
@@ -73,11 +76,13 @@ class SAMDetector:
                     if aspect < self.min_aspect or aspect > self.max_aspect:
                         continue
 
-                    regions.append({
-                        "bbox": [x1, y1, x2, y2],
-                        "conf": conf,
-                        "class_id": 1,
-                    })
+                    regions.append(
+                        {
+                            "bbox": [x1, y1, x2, y2],
+                            "conf": conf,
+                            "class_id": 1,
+                        }
+                    )
 
                     if annotated is not None:
                         cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 255, 0), 2)
