@@ -8,7 +8,7 @@ from ultralytics import FastSAM
 class SAMDetector:
     def __init__(
         self,
-        model_path: str = "models/sam/FastSAM-s.pt",
+        model_path: str = "models/sam/FastSAM-x.pt",
         prompt: str = "toy car",
         device: str = "cuda",
         conf: float = 0.45,
