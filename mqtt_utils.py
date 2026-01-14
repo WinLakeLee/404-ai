@@ -1,3 +1,177 @@
+from _daily_logger import DailyLogger
+
+dlogger = DailyLogger()
+
+
+def find_base64_image(data: bytes, max_depth=3) -> bytes:
+    """
+    여러 번 base64 디코딩을 반복하여 이미지 매직넘버가 나올 때까지 시도
+    """
+    import base64
+    import json
+    from PIL import Image
+    import io
+
+    # 이미지 매직넘버 및 픽셀 크기 확인
+    def is_image_bytes(b: bytes) -> bool:
+        try:
+            img = Image.open(io.BytesIO(b))
+            w, h = img.size
+            return w > 0 and h > 0
+        except Exception:
+            return False
+
+    # dict에서 이미지 후보 추출
+    def extract_image_from_dict(obj):
+        # 이미지로 간주할 key name 확장
+        keys = [
+            "image",
+            "images",
+            "photo",
+            "picture",
+            "img",
+            "file",
+            "frame",
+            "content",
+            "data",
+            "buffer",
+        ]
+        found = []
+        for k in keys:
+            if k in obj:
+                dlogger.log(
+                    f"[MQTT DEBUG] extract_image_from_dict found key={k}", level="debug"
+                )
+                v = obj[k]
+                # list of items: items can be strings, bytes, or nested dicts
+                if isinstance(v, list):
+                    for item in v:
+                        # if item is dict like {"image": "..."}, try recursively
+                        if isinstance(item, dict):
+                            nested = extract_image_from_dict(item)
+                            if nested:
+                                found.extend(nested)
+                                continue
+                        b = try_parse_image(item)
+                        if b is not None:
+                            found.append(b)
+                elif isinstance(v, dict):
+                    nested = extract_image_from_dict(v)
+                    if nested:
+                        found.extend(nested)
+                else:
+                    b = try_parse_image(v)
+                    if b is not None:
+                        found.append(b)
+        return found if found else None
+
+    def try_parse_image(val):
+        # 문자열이면 base64 디코딩 시도
+        # dict이면 내부 키를 탐색
+        if isinstance(val, dict):
+            nested = extract_image_from_dict(val)
+            if nested:
+                dlogger.log(
+                    f"[MQTT DEBUG] try_parse_image: parsed nested dict, found {len(nested)} images",
+                    level="debug",
+                )
+                return nested[0]
+        if isinstance(val, str):
+            s = val.strip()
+            if s.startswith("data:") and "base64," in s:
+                s = s.split("base64,", 1)[1]
+            try:
+                b = base64.b64decode(s, validate=True)
+                dlogger.log(
+                    f"[MQTT DEBUG] try_parse_image: decoded string -> {len(b)} bytes, head={b[:16].hex()}",
+                    level="debug",
+                )
+                if is_image_bytes(b):
+                    dlogger.log(
+                        f"[MQTT DEBUG] try_parse_image: valid image (w>0,h>0) after decode",
+                        level="debug",
+                    )
+                    return b
+            except Exception:
+                dlogger.log(
+                    f"[MQTT DEBUG] try_parse_image: base64 decode failed for candidate (len={len(s)})",
+                    level="debug",
+                )
+                pass
+        # bytes면 바로 확인
+        if isinstance(val, bytes):
+            dlogger.log(
+                f"[MQTT DEBUG] try_parse_image: candidate bytes len={len(val)}, head={val[:16].hex()}",
+                level="debug",
+            )
+            if is_image_bytes(val):
+                dlogger.log(
+                    f"[MQTT DEBUG] try_parse_image: candidate bytes is valid image",
+                    level="debug",
+                )
+                return val
+        return None
+
+    current = data
+    for _ in range(max_depth):
+        # 1. bytes가 이미지면 리스트로 반환
+        try:
+            if is_image_bytes(current):
+                dlogger.log(
+                    f"[MQTT DEBUG] find_base64_image: input is image bytes ({len(current)} bytes), head={current[:16].hex()}",
+                    level="debug",
+                )
+                return {"image": current}
+        except Exception:
+            pass
+        # 2. 텍스트로 변환해서 dict 구조면 key 탐색
+        try:
+            s = current.decode("utf-8", errors="ignore").strip()
+            if s.startswith("{") or s.startswith("["):
+                try:
+                    obj = json.loads(s)
+                    if isinstance(obj, dict):
+                        found = extract_image_from_dict(obj)
+                        if found is not None and len(found) > 0:
+                            if len(found) == 1:
+                                return {"image": found[0]}
+                            else:
+                                return {"image": found}
+                except Exception:
+                    dlogger.log(
+                        "[MQTT DEBUG] JSON loads failed during payload parse",
+                        level="debug",
+                    )
+                    pass
+        except Exception:
+            dlogger.log(
+                "[MQTT DEBUG] find_base64_image: decode to text failed or not JSON",
+                level="debug",
+            )
+            pass
+        # 3. base64 디코딩 반복
+        try:
+            s = current.decode("utf-8", errors="ignore").strip()
+            b64 = s.split("base64,", 1)[1] if "base64," in s else s
+            dlogger.log(
+                f"[MQTT DEBUG] find_base64_image: attempting base64 decode on len={len(b64)}",
+                level="debug",
+            )
+            current = base64.b64decode(b64, validate=True)
+            dlogger.log(
+                f"[MQTT DEBUG] find_base64_image: decoded -> {len(current)} bytes, head={current[:16].hex()}",
+                level="debug",
+            )
+        except Exception:
+            dlogger.log(
+                "[MQTT DEBUG] find_base64_image: iterative base64 decode failed — stopping",
+                level="debug",
+            )
+            break
+    # 실패 시 빈 리스트 반환
+    return {"image": []}
+
+
 import os
 import json
 import uuid
@@ -6,7 +180,7 @@ import time
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor
 
-# Single global executor for background MQTT publishes
+# 백그라운드 MQTT 발행용 단일 전역 실행기
 _MQTT_EXECUTOR = ThreadPoolExecutor(max_workers=2)
 
 
@@ -16,13 +190,13 @@ def _do_publish(payload: dict) -> bool:
     except Exception:
         return False
 
-    broker = os.environ.get('MQTT_BROKER', 'localhost')
-    port = int(os.environ.get('MQTT_PORT', 1883))
-    topic = os.environ.get('MQTT_TOPIC', '404ai/detections')
-    qos = int(os.environ.get('MQTT_QOS', 1))
-    username = os.environ.get('MQTT_USERNAME')
-    password = os.environ.get('MQTT_PASSWORD')
-    use_tls = os.environ.get('MQTT_TLS', '0').lower() in ('1', 'true', 'yes')
+    broker = os.environ.get("MQTT_BROKER", "localhost")
+    port = int(os.environ.get("MQTT_PORT", 1883))
+    topic = os.environ.get("MQTT_TOPIC", "camera01/result")
+    qos = int(os.environ.get("MQTT_QOS", 1))
+    username = os.environ.get("MQTT_USERNAME")
+    password = os.environ.get("MQTT_PASSWORD")
+    use_tls = os.environ.get("MQTT_TLS", "0").lower() in ("1", "true", "yes")
 
     try:
         client = mqtt.Client()
@@ -45,23 +219,22 @@ def _do_publish(payload: dict) -> bool:
 
 
 def publish_mqtt(payload: dict, async_send: bool = True) -> bool:
-    """Publish payload to MQTT using paho-mqtt (legacy helper).
+    """paho-mqtt를 사용해 페이로드를 MQTT로 발행합니다 (레거시 헬퍼).
 
-    - Adds `id` (UUID4) and `timestamp` (ISO8601 UTC) to payload if missing.
-    - If `async_send` is True, schedule publish on background thread and
-      return True immediately (best-effort). If False, publish synchronously
-      and return True/False depending on success.
+    - 페이로드에 `id`(UUID4)와 `timestamp`(ISO8601 UTC)를 추가합니다(없을 경우).
+    - `async_send`가 True이면 백그라운드 스레드에 발행 작업을 스케줄하고 즉시 True를 반환합니다(최선시도).
+      False이면 동기식으로 발행하고 성공 여부(True/False)를 반환합니다.
     """
     if not isinstance(payload, dict):
         try:
             payload = dict(payload)
         except Exception:
-            payload = {'value': str(payload)}
+            payload = {"value": str(payload)}
 
-    if 'id' not in payload:
-        payload['id'] = str(uuid.uuid4())
-    if 'timestamp' not in payload:
-        payload['timestamp'] = datetime.now(timezone.utc).isoformat()
+    if "id" not in payload:
+        payload["id"] = str(uuid.uuid4())
+    if "timestamp" not in payload:
+        payload["timestamp"] = datetime.now(timezone.utc).isoformat()
 
     if async_send:
         try:
@@ -74,144 +247,77 @@ def publish_mqtt(payload: dict, async_send: bool = True) -> bool:
         return _do_publish(payload)
 
 
-def init_flask_mqtt(app, mqtt_instance=None):
-    """Initialize Flask-MQTT callbacks on a Flask `app`.
+def publish_via_flask(
+    mqtt_client, payload: dict, topic: str = None, qos: int = None
+) -> bool:
+    """`flask_mqtt.Mqtt` 클라이언트 인스턴스를 사용해 페이로드를 발행합니다.
 
-    - `app`: Flask application instance with optional MQTT config.
-    - `mqtt_instance`: existing `flask_mqtt.Mqtt` instance or None.
-
-    Returns the `Mqtt` instance with `on_connect`/`on_message` handlers attached.
-    If initialization fails (broker unreachable or missing libs), returns a
-    NoopMqtt fallback with `publish` and `subscribe` methods that only log.
-    """
-    try:
-        from flask_mqtt import Mqtt
-    except Exception:
-        raise RuntimeError('flask-mqtt is required for Flask MQTT integration')
-
-    try:
-        mqtt = mqtt_instance or Mqtt(app)
-    except Exception:
-        logging.exception('Failed to initialize flask-mqtt; using NoopMqtt fallback')
-
-        class NoopMqtt:
-            def __init__(self):
-                self.client = None
-
-            def publish(self, topic, payload, qos=0):
-                logging.info('NoopMqtt.publish called: topic=%s payload=%s qos=%s', topic, payload, qos)
-
-            def subscribe(self, topic, qos=0):
-                logging.info('NoopMqtt.subscribe called: topic=%s qos=%s', topic, qos)
-
-        return NoopMqtt()
-
-    # If mqtt is a real flask_mqtt.Mqtt instance, attach callbacks if available.
-    try:
-        on_connect_decorator = getattr(mqtt, 'on_connect', None)
-    except Exception:
-        on_connect_decorator = None
-
-    if callable(on_connect_decorator):
-        @mqtt.on_connect()
-        def _on_connect(client, userdata, flags, rc):
-            try:
-                if rc == 0:
-                    logging.info('MQTT connected successfully (rc=0)')
-                else:
-                    logging.warning('MQTT connect returned non-zero rc=%s', rc)
-
-                topic = app.config.get('MQTT_SUBSCRIBE_TOPIC', os.environ.get('MQTT_SUBSCRIBE_TOPIC', '404ai/commands'))
-                qos = int(app.config.get('MQTT_QOS', os.environ.get('MQTT_QOS', 1)))
-                mqtt.subscribe(topic, qos)
-                logging.info('Subscribed to topic %s (qos=%s)', topic, qos)
-            except Exception:
-                logging.exception('Exception in flask-mqtt on_connect')
-
-    try:
-        on_message_decorator = getattr(mqtt, 'on_message', None)
-    except Exception:
-        on_message_decorator = None
-
-    if callable(on_message_decorator):
-        @mqtt.on_message()
-        def _on_message(client, userdata, message):
-            try:
-                payload_raw = message.payload.decode('utf-8', errors='replace')
-                try:
-                    payload = json.loads(payload_raw)
-                except Exception:
-                    payload = payload_raw
-                logging.info('MQTT message received: topic=%s payload=%s', message.topic, payload)
-            except Exception:
-                logging.exception('Exception in flask-mqtt on_message')
-
-    return mqtt
-
-
-def publish_via_flask(mqtt_client, payload: dict, topic: str = None, qos: int = None) -> bool:
-    """Publish `payload` using a `flask_mqtt.Mqtt` client instance.
-
-    This is a convenience wrapper that ensures `id` and `timestamp` are present.
+    편의 래퍼로서 `id`와 `timestamp`가 페이로드에 포함되도록 보장합니다.
     """
     if mqtt_client is None:
-        raise RuntimeError('mqtt_client (flask_mqtt.Mqtt) is required')
+        raise RuntimeError("mqtt_client (flask_mqtt.Mqtt) is required")
 
     if not isinstance(payload, dict):
         try:
             payload = dict(payload)
         except Exception:
-            payload = {'value': str(payload)}
+            payload = {"value": str(payload)}
 
-    if 'id' not in payload:
-        payload['id'] = str(uuid.uuid4())
-    if 'timestamp' not in payload:
-        payload['timestamp'] = datetime.now(timezone.utc).isoformat()
+    if "id" not in payload:
+        payload["id"] = str(uuid.uuid4())
+    if "timestamp" not in payload:
+        payload["timestamp"] = datetime.now(timezone.utc).isoformat()
 
-    topic = topic or os.environ.get('MQTT_TOPIC', '404ai/detections')
-    qos = int(qos or os.environ.get('MQTT_QOS', 1))
+    topic = topic or os.environ.get("MQTT_TOPIC", "404ai/detections")
+    qos = int(qos or os.environ.get("MQTT_QOS", 1))
 
     try:
         payload_str = json.dumps(payload, ensure_ascii=False)
         mqtt_client.publish(topic, payload_str, qos=qos)
         return True
     except Exception:
-        logging.exception('Failed to publish via flask-mqtt')
+        logging.exception("Failed to publish via flask-mqtt")
         return False
 
 
-def create_paho_client(on_message_cb=None,
-                       broker: str = None,
-                       port: int = None,
-                       username: str = None,
-                       password: str = None,
-                       use_tls: bool = False,
-                       client_id: str = None,
-                       keepalive: int = 60,
-                       subscribe_topic: str = None,
-                       qos: int = 1,
-                       start_loop: bool = True):
-    """Create and return a configured paho.mqtt.client.Client instance.
+def create_paho_client(
+    on_message_cb=None,
+    broker: str = None,
+    port: int = None,
+    username: str = None,
+    password: str = None,
+    use_tls: bool = False,
+    client_id: str = None,
+    keepalive: int = 60,
+    subscribe_topic: str = None,
+    qos: int = 1,
+    start_loop: bool = True,
+):
+    """구성된 `paho.mqtt.client.Client` 인스턴스를 생성해 반환합니다.
 
-    - `on_message_cb(client, userdata, message)` will be registered if provided.
-    - If `subscribe_topic` is provided, the client will subscribe on connect.
-    - If `start_loop` is True, `loop_start()` is called before returning.
+    - `on_message_cb(client, userdata, message)`가 제공되면 등록됩니다.
+    - `subscribe_topic`가 주어지면 연결 시 해당 토픽을 구독합니다.
+    - `start_loop`가 True이면 반환 전에 `loop_start()`를 호출합니다.
     """
     try:
         import paho.mqtt.client as mqtt
     except Exception:
-        raise RuntimeError('paho-mqtt is required to create paho client')
+        raise RuntimeError("paho-mqtt is required to create paho client")
 
-    broker = broker or os.environ.get('MQTT_BROKER', 'localhost')
-    port = int(port or os.environ.get('MQTT_PORT', 1883))
+    broker = broker or os.environ.get("MQTT_BROKER", "localhost")
+    port = int(port or os.environ.get("MQTT_PORT", 1883))
 
     # Prefer using the newer paho callback API when available to avoid deprecation warnings.
     try:
         import inspect
 
         sig = inspect.signature(mqtt.Client)
-        if 'callback_api_version' in sig.parameters:
-            client = mqtt.Client(client_id, callback_api_version=2) if client_id else mqtt.Client(callback_api_version=2)
+        if "callback_api_version" in sig.parameters:
+            client = (
+                mqtt.Client(client_id, callback_api_version=2)
+                if client_id
+                else mqtt.Client(callback_api_version=2)
+            )
         else:
             client = mqtt.Client(client_id) if client_id else mqtt.Client()
     except Exception:
@@ -222,22 +328,22 @@ def create_paho_client(on_message_cb=None,
         try:
             client.tls_set()
         except Exception:
-            logging.exception('Failed to configure TLS for paho client')
+            logging.exception("Failed to configure TLS for paho client")
 
     def _on_connect(client_, userdata, flags, rc):
         try:
             if rc == 0:
-                logging.info('paho MQTT connected (rc=0)')
+                logging.info("paho MQTT connected (rc=0)")
             else:
-                logging.warning('paho MQTT connect rc=%s', rc)
+                logging.warning("paho MQTT connect rc=%s", rc)
             if subscribe_topic:
                 try:
                     client_.subscribe(subscribe_topic, qos=qos)
-                    logging.info('paho MQTT subscribed to %s', subscribe_topic)
+                    logging.info("paho MQTT subscribed to %s", subscribe_topic)
                 except Exception:
-                    logging.exception('paho subscribe failed')
+                    logging.exception("paho subscribe failed")
         except Exception:
-            logging.exception('Exception in paho on_connect')
+            logging.exception("Exception in paho on_connect")
 
     client.on_connect = _on_connect
 
@@ -247,59 +353,228 @@ def create_paho_client(on_message_cb=None,
     try:
         client.connect(broker, port, keepalive)
     except Exception:
-        logging.exception('Failed to connect paho client to broker')
+        logging.exception("Failed to connect paho client to broker")
         # still return client (user may start loop later or use fallback)
 
     if start_loop:
         try:
             client.loop_start()
         except Exception:
-            logging.exception('Failed to start paho loop')
+            logging.exception("Failed to start paho loop")
 
     return client
 
 
-def publish_with_client(mqtt_client, payload: dict, topic: str = None, qos: int = None) -> bool:
-    """Publish using an existing paho `mqtt_client` instance."""
+def publish_with_client(
+    mqtt_client, payload: dict, topic: str = None, qos: int = None
+) -> bool:
+    """기존 paho `mqtt_client` 인스턴스를 사용해 페이로드를 발행합니다."""
     if mqtt_client is None:
-        raise RuntimeError('mqtt_client is required')
+        raise RuntimeError("mqtt_client is required")
 
     if not isinstance(payload, dict):
         try:
             payload = dict(payload)
         except Exception:
-            payload = {'value': str(payload)}
+            payload = {"value": str(payload)}
 
-    if 'id' not in payload:
-        payload['id'] = str(uuid.uuid4())
-    if 'timestamp' not in payload:
-        payload['timestamp'] = datetime.now(timezone.utc).isoformat()
+    if "id" not in payload:
+        payload["id"] = str(uuid.uuid4())
+    if "timestamp" not in payload:
+        payload["timestamp"] = datetime.now(timezone.utc).isoformat()
 
-    topic = topic or os.environ.get('MQTT_TOPIC', '404ai/detections')
-    qos = int(qos or os.environ.get('MQTT_QOS', 1))
+    topic = topic or os.environ.get("MQTT_TOPIC", "404ai/detections")
+    qos = int(qos or os.environ.get("MQTT_QOS", 1))
 
     try:
         payload_str = json.dumps(payload, ensure_ascii=False)
         mqtt_client.publish(topic, payload_str, qos=qos)
         return True
     except Exception:
-        logging.exception('Failed to publish via provided paho client')
+        logging.exception("Failed to publish via provided paho client")
         return False
 
 
-def is_client_connected(mqtt_client) -> bool:
-    """Return True if the provided paho `mqtt_client` appears connected.
+def start_paho_listener(
+    process_image_cb,
+    validate_image_format_cb,
+    aggregate_fn,
+    upload_dir: str,
+    upload_counter,
+    upload_counter_lock,
+    logger,
+    executor=None,
+    broker: str = None,
+    port: int = None,
+    use_tls: bool = False,
+    in_topic: str = None,
+    out_topic: str = None,
+    out_qos: int = 1,
+    send_ack: bool = False,
+    ack_topic: str = None,
+):
+    """`in_topic`를 수신(listen)하고, `find_base64_image`로 이미지를 디코딩한 뒤
+    `process_image_cb`로 각 이미지를 처리하고, 집계된 결과를 `publish_with_client`/`publish_mqtt`로 발행하는
+    paho 클라이언트를 생성하고 시작합니다.
 
-    This tries several non-destructive checks in order:
-    - call `is_connected()` if available
-    - check for underlying socket `_sock` or `socket`
-    - check internal `_state` against paho's `mqtt_cs_connected`
-    - as a last resort, attempt a non-blocking `publish` and inspect the rc
+    반환값은 paho 클라이언트 인스턴스입니다(연결 실패 시 부분적으로만 초기화될 수 있음).
+    """
+    broker = broker or os.environ.get("MQTT_BROKER") or "localhost"
+    port = int(port or os.environ.get("MQTT_PORT") or 1883)
+    in_topic = in_topic or os.environ.get("IN_MQTT_TOPIC") or "camera01/control"
+    out_topic = out_topic or os.environ.get("MQTT_TOPIC") or "camera01/result"
+    out_qos = int(
+        out_qos or os.environ.get("OUT_MQTT_QOS") or os.environ.get("MQTT_QOS") or 1
+    )
+
+    def _normalize_payload(data: bytes):
+        return find_base64_image(data)
+
+    def _on_message(client, userdata, message):
+        def _task():
+            try:
+                payload_result = _normalize_payload(message.payload)
+                logger.log(
+                    f"[MQTT DEBUG] find_base64_image result type: {type(payload_result)}",
+                    level="debug",
+                )
+                images = []
+                if isinstance(payload_result, dict) and "image" in payload_result:
+                    img_val = payload_result["image"]
+                    if isinstance(img_val, list):
+                        images = img_val
+                    else:
+                        images = [img_val]
+                else:
+                    images = [payload_result]
+
+                # optional ack
+                try:
+                    if send_ack:
+                        ack_t = ack_topic or f"{out_topic}_ack"
+                        publish_with_client(
+                            client,
+                            {"id": broker, "timestamp": datetime.now().isoformat()},
+                            topic=ack_t,
+                            qos=out_qos,
+                        )
+                except Exception:
+                    try:
+                        publish_mqtt({"error": "ack_failed"})
+                    except Exception:
+                        pass
+
+                responses = []
+                non_pass_responses = []
+                for idx, payload in enumerate(images, start=1):
+                    try:
+                        if isinstance(payload, (bytes, bytearray)):
+                            plen = len(payload)
+                            logger.log(
+                                f"[MQTT DEBUG] extracted payload type={type(payload)}, len={plen}",
+                                level="debug",
+                            )
+                            if plen:
+                                logger.log(
+                                    f"[MQTT DEBUG] payload head hex: {payload[:32].hex()}",
+                                    level="debug",
+                                )
+                        else:
+                            s = str(payload)
+                            logger.log(
+                                f"[MQTT DEBUG] extracted payload type={type(payload)}, repr head={s[:128]!r}",
+                                level="debug",
+                            )
+                    except Exception as _e:
+                        logger.log(
+                            f"[MQTT DEBUG] payload debug failed: {_e}", level="debug"
+                        )
+
+                    img_info = validate_image_format_cb(payload)
+                    if not img_info.get("valid"):
+                        img_info = {
+                            "valid": True,
+                            "format": "jpg",
+                            "extension": ".jpg",
+                            "mime_type": "image/jpeg",
+                            "size": (
+                                len(payload)
+                                if isinstance(payload, (bytes, bytearray))
+                                else 0
+                            ),
+                            "width": 0,
+                            "height": 0,
+                        }
+
+                    base_name = f"mqtt_{message.topic.replace('/', '_')}"
+                    if len(images) > 1:
+                        filename = f"{base_name}_{idx}{img_info['extension']}"
+                    else:
+                        filename = f"{base_name}{img_info['extension']}"
+                    logger.log(
+                        f"✅ MQTT 이미지 수신: {filename} ({img_info.get('width',0)}x{img_info.get('height',0)}, {img_info.get('size',0)} bytes)",
+                        level="info",
+                    )
+
+                    resp = process_image_cb(
+                        payload, filename, img_info.get("mime_type")
+                    )
+                    responses.append(resp)
+                    if resp.get("detection", {}).get("result") != "pass":
+                        non_pass_responses.append(resp)
+                    else:
+                        logger.log(
+                            f"Image {idx} detection result == 'pass' (no car); skip publish for this image unless another requires publish)",
+                            level="debug",
+                        )
+
+                if len(non_pass_responses) == 0:
+                    logger.log(
+                        "MQTT publish skipped: all images result == 'pass' (no car)",
+                        level="info",
+                    )
+                else:
+                    aggregated = aggregate_fn(responses, include_images=True)
+                    try:
+                        publish_with_client(
+                            client, aggregated, topic=out_topic, qos=out_qos
+                        )
+                    except Exception:
+                        publish_mqtt(aggregated)
+            except Exception:
+                logger.log("Exception in mqtt on_message handler", level="error")
+
+        if executor is not None:
+            executor.submit(_task)
+        else:
+            _task()
+
+    paho_client = create_paho_client(
+        on_message_cb=_on_message,
+        broker=broker,
+        port=port,
+        use_tls=use_tls,
+        subscribe_topic=in_topic,
+        qos=out_qos,
+        start_loop=True,
+    )
+
+    return paho_client
+
+
+def is_client_connected(mqtt_client) -> bool:
+    """주어진 paho `mqtt_client`가 연결된 것으로 보이면 True를 반환합니다.
+
+    비파괴적인 여러 검사를 순서대로 시도합니다:
+    - `is_connected()`가 있으면 호출
+    - 내부 소켓 `_sock` 또는 `socket` 존재 확인
+    - 내부 `_state`를 paho의 `mqtt_cs_connected`와 비교
+    - 마지막 수단으로 비차단 `publish`를 시도하고 반환 코드를 검사
     """
     if mqtt_client is None:
         return False
     try:
-        is_conn = getattr(mqtt_client, 'is_connected', None)
+        is_conn = getattr(mqtt_client, "is_connected", None)
         if callable(is_conn):
             try:
                 return bool(is_conn())
@@ -307,14 +582,17 @@ def is_client_connected(mqtt_client) -> bool:
                 pass
 
         # common internal socket attribute
-        sock = getattr(mqtt_client, '_sock', None) or getattr(mqtt_client, 'socket', None)
+        sock = getattr(mqtt_client, "_sock", None) or getattr(
+            mqtt_client, "socket", None
+        )
         if sock:
             return True
 
-        state = getattr(mqtt_client, '_state', None)
+        state = getattr(mqtt_client, "_state", None)
         if state is not None:
             try:
                 import paho.mqtt.client as _mqtt
+
                 return state == _mqtt.mqtt_cs_connected
             except Exception:
                 # fallback: connected state is usually 1
@@ -322,8 +600,8 @@ def is_client_connected(mqtt_client) -> bool:
 
         # Last resort: attempt a quick publish and inspect return code.
         try:
-            info = mqtt_client.publish('__health_check_404ai', 'ping', qos=0)
-            rc = getattr(info, 'rc', None)
+            info = mqtt_client.publish("__health_check_404ai", "ping", qos=0)
+            rc = getattr(info, "rc", None)
             if rc is None:
                 # older paho may return tuple-like result
                 try:
@@ -337,32 +615,38 @@ def is_client_connected(mqtt_client) -> bool:
         return False
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     # Basic demo: start Flask-MQTT for a few seconds to check callbacks.
     logging.basicConfig(level=logging.INFO)
-    print('Starting MQTT subscriber demo (will run ~5s)')
+    dlogger.log("Starting MQTT subscriber demo (will run ~5s)", level="info")
     mqtt_client = None
     try:
         try:
             from flask import Flask
         except Exception:
-            raise RuntimeError('Flask is required for demo')
+            raise RuntimeError("Flask is required for demo")
 
         app = Flask(__name__)
         # Allow env/config overrides via Flask config
-        for k in ('MQTT_BROKER', 'MQTT_PORT', 'MQTT_USERNAME', 'MQTT_PASSWORD', 'MQTT_QOS', 'MQTT_SUBSCRIBE_TOPIC'):
+        for k in (
+            "MQTT_BROKER",
+            "MQTT_PORT",
+            "MQTT_USERNAME",
+            "MQTT_PASSWORD",
+            "MQTT_QOS",
+            "MQTT_SUBSCRIBE_TOPIC",
+        ):
             if k in os.environ:
                 app.config[k] = os.environ[k]
 
-        mqtt_client = init_flask_mqtt(app)
         # allow some time for connect/subscribe events (noop fallback won't block)
         time.sleep(5)
     except Exception:
-        logging.exception('Demo subscriber failed')
+        logging.exception("Demo subscriber failed")
     finally:
         try:
             if mqtt_client is not None:
-                client = getattr(mqtt_client, 'client', None)
+                client = getattr(mqtt_client, "client", None)
                 if client is not None:
                     try:
                         client.loop_stop()
@@ -371,4 +655,4 @@ if __name__ == '__main__':
                         pass
         except Exception:
             pass
-    print('Demo finished')
+    dlogger.log("Demo finished", level="info")

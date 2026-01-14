@@ -1,0 +1,92 @@
+from typing import List, Dict, Tuple, Union
+import os
+
+import cv2
+from ultralytics import FastSAM
+
+
+class SAMDetector:
+    def __init__(
+        self,
+        model_path: str = "models/sam/FastSAM-x.pt",
+        prompt: str = "toy car",
+        device: str = "cuda",
+        conf: float = 0.45,
+        imgsz: int = 640,
+    ):
+        self.model_path = model_path
+        # 빠른 튜닝을 위해 환경변수로 프롬프트를 재정의할 수 있음
+        self.prompt = os.getenv("SAM_PROMPT", prompt)
+        self.device = device
+        self.conf = float(os.getenv("SAM_MIN_CONF", conf))
+        self.imgsz = imgsz
+        # 유지할 탐지의 최소 면적 비율(bbox면적 / 이미지면적)
+        self.min_area_ratio = float(os.getenv("SAM_MIN_AREA_RATIO", 0.002))
+        # 종횡비 필터(w/h): 지나치게 얇거나 퍼진 형태를 제외
+        self.min_aspect = float(os.getenv("SAM_MIN_ASPECT", 0.3))
+        self.max_aspect = float(os.getenv("SAM_MAX_ASPECT", 3.0))
+        self.model = FastSAM(model_path)
+
+    def detect(
+        self, image_path, return_image: bool = False, **kwargs
+    ) -> Union[List[Dict], Tuple[List[Dict], "cv2.Mat"]]:
+        """FastSAM을 실행하여 감지 결과를 반환합니다. 선택적으로 주석이 그려진 BGR 이미지를 함께 반환할 수 있습니다.
+
+        `return_image=True`이면 원본 이미지의 복사본에 박스만 그려 반환하므로
+        FastSAM의 RGB 렌더 출력 대신 색상이 유지됩니다.
+        """
+        image = cv2.imread(str(image_path))
+        if image is None:
+            raise ValueError(f"이미지를 로드할 수 없습니다: {image_path}")
+
+        # accept and ignore conf_override for API compatibility with YOLO detector
+        results = self.model(
+            source=str(image_path),
+            texts=[self.prompt],
+            device=str(self.device),
+            retina_masks=True,
+            imgsz=self.imgsz,
+            conf=self.conf,
+            verbose=False,
+        )
+
+        regions: List[Dict] = []
+        annotated = image.copy() if return_image else None
+
+        if len(results) > 0:
+            boxes = getattr(results[0], "boxes", None)
+            if boxes is not None and len(boxes) > 0:
+                ih, iw = image.shape[:2]
+                for box in boxes:
+                    x1, y1, x2, y2 = map(int, box.xyxy[0].cpu().numpy())
+                    conf = float(box.conf[0])
+                    # filter by confidence
+                    if conf < self.conf:
+                        continue
+                    # filter by box area relative to image
+                    w = max(0, x2 - x1)
+                    h = max(0, y2 - y1)
+                    area = w * h
+                    if area < (ih * iw * self.min_area_ratio):
+                        continue
+                    # filter by aspect ratio (avoid very thin/flat segments)
+                    if h == 0:
+                        continue
+                    aspect = float(w) / float(h)
+                    if aspect < self.min_aspect or aspect > self.max_aspect:
+                        continue
+
+                    regions.append(
+                        {
+                            "bbox": [x1, y1, x2, y2],
+                            "conf": conf,
+                            "class_id": 1,
+                        }
+                    )
+
+                    if annotated is not None:
+                        cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 255, 0), 2)
+
+        if return_image:
+            return regions, annotated
+        return regions
